@@ -23,8 +23,8 @@
 # 除了多花几分钟构建时间没有别的代价。
 #
 # ── 需要的东西 ─────────────────────────────────────────────────
-#   · GHCR：用内置 GITHUB_TOKEN，无需配置。**首次推送后到包的设置页把可见性改成
-#     Public**，否则别人 docker pull 会 401（Actions 自己读写不受影响）。
+#   · GHCR：用内置 GITHUB_TOKEN，无需配置。公开仓库推出来的包实测即可匿名拉取；
+#     万一 pull 报 401，再到包的设置页把可见性改成 Public（workflow 改不了可见性）。
 #   · Docker Hub（可选）：配两个 Secret 才启用，不配则自动跳过、不报错：
 #       DOCKERHUB_USERNAME / DOCKERHUB_TOKEN（Access Token，权限 Read & Write）
 #   · 可选仓库变量 IMAGE_NAME：改镜像名（默认 workbuddy2api）
@@ -324,7 +324,7 @@ jobs:
             echo ""
             echo "上游附件摘要：\`sha256:${DIGEST}\`"
             echo ""
-            echo "> 首次推送后请到包的设置页把可见性改成 **Public**，否则别人 pull 会 401。"
+            echo "> 若别人 pull 报 401，到包的设置页把可见性改成 **Public**（公开仓库通常无需这一步）。"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: 无变化时的小结

@@ -89,11 +89,11 @@ gh workflow run workbuddy2api.yml -f force=true    # 强制重新构建
 1. 把这个仓库推上去（或在 GitHub 上 fork 后推一次）。
    `push` 触发只在**本 workflow 文件变化**时生效，所以推上来就会立刻构建一份，
    不用等定时。
-2. 构建完成后到 **Packages → workbuddy2api → Package settings** 把可见性改成
-   **Public**，否则别人 `docker pull` 会 401（Actions 自己读写不受这个影响）。
-   > 这一步只能手动做：用 `GITHUB_TOKEN` 推送创建的包默认是私有的，
-   > workflow 里改不了可见性。
-3. 拉取：`docker pull ghcr.io/<你的用户名>/workbuddy2api:latest`
+2. 拉取：`docker pull ghcr.io/<你的用户名>/workbuddy2api:latest`
+   > 公开仓库推出来的包**实测即可匿名拉取**，不用额外设置（本仓库已验证）。
+   > 若你那边 `pull` 报 401，再去 **Packages → workbuddy2api → Package settings**
+   > 把可见性改成 **Public** —— 包可见性只能在网页上改，workflow 里改不了。
+3. （可选）要同时推一份到 Docker Hub，加两个 Secret 即可，见下面「配置项」。
 
 镜像名里的用户名会自动取仓库所有者（含大写自动转小写，GHCR 不收大写名），
 所以 fork 之后**不用改任何文件**。
