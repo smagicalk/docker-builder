@@ -242,12 +242,11 @@ compose 换成只有 `image:` 的版本即可（`--build` 对没有 `build:` 段
 
 ---
 
-## 在 Kubernetes 里跑（两套独立部署）
+## 在 Kubernetes 里跑（上游 + 面板同一个 Pod）
 
-清单在 [`deploy/k8s/`](deploy/k8s/)。**上游与面板是两套独立的部署**：各带自己的
-PersistentVolume、各自的 Service 与 Deployment，面板**不挂上游的任何目录**，
-只通过 Service 走 HTTP 连过去（`WB2API_BASE=http://workbuddy2api:7863`）——
-所以两边互不等待，各自调度、各自升级重启。
+清单在 [`deploy/k8s/`](deploy/k8s/)。**两个容器放进同一个 Deployment**：上游网关与面板
+共用一个 Pod，于是可以挂同一块卷 —— 面板那两项「天生要靠直接读写上游文件」的功能
+（扫码加号、设置页保存）就都能用了。
 
 ```bash
 # 1) 命名空间 + 密钥。Secret 是命名空间级的，而且**刻意不放进清单** ——
@@ -257,54 +256,49 @@ kubectl -n workbuddy create secret generic workbuddy2api-secret \
   --from-literal=api_key="$(openssl rand -hex 32)" \
   --dry-run=client -o yaml | kubectl apply -f -
 
-# 2) 上游 + 面板
-kubectl apply -f deploy/k8s/10-upstream.yaml deploy/k8s/20-manager.yaml
+# 2) 整套（4 PV/PVC + 配置种子 + 两个容器 + 2 Service）
+kubectl apply -f deploy/k8s/10-stack.yaml
 
-# 3) 加账号、打开面板（首启随机密码在日志里）
-kubectl -n workbuddy exec -it deploy/workbuddy2api -- ./login.sh --realm=cn
-kubectl -n workbuddy logs deploy/workbuddy-manager | grep -A2 密码
+# 3) 打开面板：首启随机密码在日志里（建了 manager-secret 就是你给的那个）
+kubectl -n workbuddy logs deploy/workbuddy -c workbuddy-manager | grep -A2 密码
 kubectl -n workbuddy port-forward svc/workbuddy-manager 7864:7864
 ```
 
-三块卷都是 `hostPath`（路径固定、`Retain` 不自动删）、**每个组件各自独享**（`config.json`
-不占卷 —— 它是只读的 ConfigMap）：
+四块卷都是 `hostPath`（路径固定、`Retain` 不自动删），**前两块被两个容器共享**：
 
 | 卷 | 宿主机路径 | 挂给谁 | 里面是什么 |
 |---|---|---|---|
-| `workbuddy2api-auths` 1Gi | `/srv/workbuddy/upstream/auths` | 上游 `/app/auths` | 账号凭证（**最该备份的**） |
+| `workbuddy2api-config` 1Gi | `/srv/workbuddy/upstream/config` | 上游 `/app/config.json`（只读）＋ 面板 `/opt/workbuddy2api/config.json`（读写） | `config.json`（上游全部配置） |
+| `workbuddy2api-auths` 1Gi | `/srv/workbuddy/upstream/auths` | 上游 `/app/auths` ＋ 面板 `/opt/workbuddy2api/auths` | 账号凭证（**最该备份的**） |
 | `workbuddy2api-pool` 1Gi | `/srv/workbuddy/upstream/pool` | 上游 `/app/data` | `state.json`、成本账本 |
 | `workbuddy-manager-data` 5Gi | `/srv/workbuddy/manager/data` | 面板 `/app/data` | SQLite 库、`users.json` |
 
-**拆开部署的代价**（原因在上游的设计里：它既没有「加账号」的 HTTP 接口，也没有
-热改配置的接口，那两项天生要靠直接读写上游的文件）：
+`config.json` 里没有任何密钥：`api_key` 由 Secret 经 `WB2A_API_KEY`（上游）与
+`WB2API_KEY`（面板）注入，文件里留空即可。
 
-| 面板功能 | 拆开后 | 替代做法 |
-|---|---|---|
-| 扫码「添加账号」 | ✗ **看似成功**：会写进面板容器自己的目录，上游读不到（显示「未加载」）、重启即丢 —— 清单里已用只读空卷把它变成硬报错 | 上游容器内执行 `./login.sh --realm=cn` |
-| 「设置」页保存 | ✗ 读不到 `config.json` → 报错并锁定保存 | 改 ConfigMap + 重启上游 |
-| 重启上游 / 读上游日志 / 一键更新 / 端口收敛 | ✗ 降级提示（k8s 里没有 docker 守护进程） | `kubectl -n workbuddy logs`、`rollout restart` |
-| 仪表盘、账号列表、密钥、日志、用量、IP 管控、模型中心、测试台 | ✓ 照常 | 只走 HTTP，不受影响 |
+**仍然存在的限制**：上游**只在启动时读一次配置**（源码 `cmd/server/main.go` 里只有一次
+`Load`，没有 fsnotify、没有 SIGHUP），所以面板「设置」页保存成功后要自己重启一次才生效：
 
-> 「添加账号」为什么会**看似成功**：面板落盘凭证时会自己 `mkdir` 出 `auths/`
-> （`server/services/tencent.py` 的 `write_auth_file`），而镜像里 `/opt/workbuddy2api`
-> 本来就存在 —— 于是它会写进面板容器自己那层临时文件系统。清单里给该路径挂了
-> **只读空卷**，写入会立刻失败、当场暴露（**别**换成可写的 emptyDir）。
-> 有 RWX 存储（NFS / CephFS / Longhorn）时可以**只共享 `auths/`** 找回「加账号」——
-> 上游对它**热加载**（每 5 秒重扫目录），加完立刻生效、不用重启；「设置」则要连
-> `config.json` 一起共享，**并自己重启上游**（上游只在启动时读一次配置）。
-> 两个方案的挂法与坑（其中一个挂法会让容器起不来）都写在
-> [`deploy/k8s/README.md`](deploy/k8s/README.md)。
+```bash
+kubectl -n workbuddy rollout restart deploy/workbuddy
+```
+
+忘重启的症状是**「设置页显示已保存、上游行为没变」**，很难查。
+**加账号不用重启**：上游每 5 秒重扫 `auths/`（`internal/pool/watch.go`），面板扫码写进去就进池。
+细节与全部坑位见 [`deploy/k8s/README.md`](deploy/k8s/README.md)。
 
 几处刻意的设计（理由都写在清单注释里）：
 
 | 点 | 做法 | 为什么 |
 |---|---|---|
 | 上游副本数 | **固定 `replicas: 1`** + `strategy: Recreate` | 账号池是单进程本地状态：多副本会各自跑一遍定时任务并争抢同一份 `state.json` |
-| 面板与上游 | 不共享卷、无 `podAffinity` | 拆开部署后才能独立调度与升级：上游没起来，面板照样 Running 并显示「上游不可用」 |
+| 两个容器 | 同一个 Pod | 共享 RWO 卷不需要 `podAffinity`（同一个 Pod 不可能跨节点）；面板可直接连 `127.0.0.1:7863` |
+| 同 Pod 的代价 | Pod Ready 聚合、镜像拉取是单点、只能整 Pod 重启 | 上游容器崩了，面板的 Service 也会失去 endpoint —— 更看重「面板独立可用」就按 README 里的「拆成两套部署」拆开 |
 | 卷属主 | `fsGroup: 10001` | 等价于 Docker 那步 `chown -R 10001:10001`，不用手工改 |
 | 上游探针 | **TCP 探针**，不用 `/healthz` | `/healthz` 空池返回 503：当 liveness 会反复重启，当 readiness 会让加账号都做不了 |
 | 面板探针 | `httpGet /api/healthz` | 该接口只返回 `{ok: true}`、不依赖上游，所以上游挂了面板仍 Ready |
-| api_key | Secret 是唯一真源：上游用 `WB2A_API_KEY` 环境变量，面板用 `WB2API_KEY` | 两处都指向同一个 Secret，不会各说一套；`config.json` 里的 api_key 恒被忽略 |
+| 容器端口名 | 上游 `api` / 面板 `web` | 同一个 Pod 里两个容器都有 http 端口时，Service 用命名端口会分不清该指向谁 |
+| api_key | Secret 是唯一真源 | 两处都指向同一个 Secret，不会各说一套；`config.json` 里的 api_key 恒被忽略 |
 
 ---
 
