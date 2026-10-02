@@ -1,0 +1,15 @@
+# 一整套 WorkBuddy 部署的命名空间。
+#
+# 用独立命名空间有两个实际原因，不只是好看：
+#   · 下面那些 PV 用 claimRef 钉住 PVC（避免静态供给时 PV 被别的 PVC 抢走），
+#     claimRef 里要写命名空间 —— 固定下来才不用每处都改。
+#   · 面板与上游要在同一命名空间里用 Service 名互连（workbuddy2api:7863）。
+#
+# 想装进已有命名空间：删掉本文件，把三个 yaml 里所有 metadata.namespace 与
+# PV 的 claimRef.namespace 改成你的命名空间。
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: workbuddy
+  labels:
+    app.kubernetes.io/part-of: workbuddy

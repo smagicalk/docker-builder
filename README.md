@@ -242,37 +242,53 @@ compose 换成只有 `image:` 的版本即可（`--build` 对没有 `build:` 段
 
 ---
 
-## 在 Kubernetes 里跑
+## 在 Kubernetes 里跑（面板 + 上游一套齐）
 
-清单是一个文件：[`deploy/k8s.yaml`](deploy/k8s.yaml)，里面是 Secret、ConfigMap、两个 PVC、
-Deployment、Service，末尾还带一份注释掉的 Ingress 示例。已用 `kubeconform -strict`
-校验过（7 个资源全 valid）。
+清单在 [`deploy/k8s/`](deploy/k8s/) —— **两个组件都有**：上游网关（本仓库构建的镜像）
+与官方发布的管理面板，各自带 PersistentVolume / PersistentVolumeClaim。
+存储对应表、换成 NFS / 云盘、常见坑都写在
+[`deploy/k8s/README.md`](deploy/k8s/README.md)。
 
 ```bash
-kubectl apply -f deploy/k8s.yaml
-kubectl rollout status deploy/workbuddy2api
-kubectl exec -it deploy/workbuddy2api -- ./login.sh --realm=cn   # 扫码加账号
-kubectl port-forward svc/workbuddy2api 7863:7863                 # 本机验证
+# 1) 命名空间 + 密钥。Secret 是命名空间级的，而且**刻意不放进清单** ——
+#    放进清单会被 apply 用占位值把你的真密钥覆盖回去
+kubectl apply -f deploy/k8s/00-namespace.yaml
+kubectl -n workbuddy create secret generic workbuddy2api-secret \
+  --from-literal=api_key="$(openssl rand -hex 32)" \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+# 2) 上游 + 面板
+kubectl apply -f deploy/k8s/10-upstream.yaml deploy/k8s/20-manager.yaml
+
+# 3) 扫码加账号、打开面板（首启随机密码在日志里）
+kubectl -n workbuddy exec -it deploy/workbuddy2api -- ./login.sh --realm=cn
+kubectl -n workbuddy logs deploy/workbuddy-manager | grep -A2 密码
+kubectl -n workbuddy port-forward svc/workbuddy-manager 7864:7864
 ```
 
-与 Docker 部署的三处差异，都是刻意的：
+三块卷都是 `hostPath`（路径固定、`Retain` 不自动删），对应关系一览：
+
+| 卷 | 宿主机路径 | 挂给谁 | 里面是什么 |
+|---|---|---|---|
+| `workbuddy2api-shared` 1Gi | `/srv/workbuddy/shared` | 上游 `/app/auths` + `/app/config.json`；面板 `/opt/workbuddy2api` | 账号凭证 + 配置（**两个组件共享**这个卷） |
+| `workbuddy2api-pool` 1Gi | `/srv/workbuddy/upstream-pool` | 上游 `/app/data` | `state.json`、成本账本 |
+| `workbuddy-manager-data` 5Gi | `/srv/workbuddy/manager-data` | 面板 `/app/data` | SQLite 库、`users.json` |
+
+几处刻意的设计（理由都写在清单注释里）：
 
 | 点 | 做法 | 为什么 |
 |---|---|---|
-| 副本数 | **固定 `replicas: 1`**，更新用 `strategy: Recreate` | 账号池是单进程本地状态 + 本地 `auths/`：多副本会各自把定时任务跑一遍（重复签到、重复领奖，还有 WAF 风险），并争抢同一份 `state.json`。真要扩容，先关掉 `schedule.*` 那几个开关 |
-| 卷属主 | `securityContext.fsGroup: 10001` | k8s 里不用手工 `chown`；fsGroup 会把 PVC 属主整好，等价于上面第 2 步 |
-| 探针 | 用 **TCP 探针**，不是 `/healthz` | `/healthz` 在账号池为空时返回 503：当 liveness 会让 Pod 反复重启；当 readiness 会让「还没加账号」时 Service 不转发，连扫码加账号都做不了 |
+| 上游副本数 | **固定 `replicas: 1`** + `strategy: Recreate` | 账号池是单进程本地状态：多副本会各自跑一遍定时任务并争抢同一份 `state.json` |
+| 共享卷 | 面板用 `podAffinity` 钉在上游所在节点 | 共享卷是 RWO（同节点多 Pod 可挂、跨节点不行），而 `config.json` 又必须可写 |
+| 卷属主 | `fsGroup: 10001` | 等价于 Docker 那步 `chown -R 10001:10001`，不用手工改 |
+| 上游探针 | **TCP 探针**，不用 `/healthz` | `/healthz` 空池返回 503：当 liveness 会反复重启，当 readiness 会让加账号都做不了 |
+| 面板探针 | `httpGet /api/healthz` | 该接口只返回 `{ok: true}`、不依赖上游，所以上游挂了面板仍 Ready，界面才能显示「上游不可用」 |
+| api_key | Secret 为真源，上游 init 容器每次启动同步进 `config.json` | 文件必须可写（面板要改它）而 Secret 挂载只读；这样面板与 `login.sh` 读到的总是同一份值 |
 
-`api_key` 单独走 Secret、由环境变量 `WB2A_API_KEY` 注入（上游本身支持用环境变量覆盖
-配置），所以密钥不会落到 ConfigMap 里。建议这样建，而不是把密钥写进 YAML：
-
-```bash
-kubectl create secret generic workbuddy2api-secret \
-  --from-literal=api_key="$(openssl rand -hex 32)" \
-  --dry-run=client -o yaml | kubectl apply -f -
-```
-
-镜像换新后滚动一次：`kubectl rollout restart deploy/workbuddy2api`。
+k8s 里没有 docker 守护进程，面板的「重启上游 / 读上游日志 / 一键更新 / 端口收敛」
+会降级为「请到宿主机操作」并如实提示，替代命令是
+`kubectl -n workbuddy rollout restart deploy/workbuddy2api`；
+**账号管理、密钥、日志、用量、IP 管控、模型中心、测试台照常可用**。
 
 ---
 

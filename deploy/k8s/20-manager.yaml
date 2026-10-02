@@ -1,0 +1,261 @@
+# WorkBuddy Manager（管理面板 + 对外反代网关）—— 整套部署的入口。
+# 镜像用官方发布的那份：ghcr.io/ithtelab/workbuddy-manager:latest（多架构，已验证可匿名拉取）
+#
+# 部署顺序：00-namespace → 10-upstream → 本文件（面板要连上游的 Service，
+# 而且要挂上游写好的共享卷，所以必须在上游之后）。
+#   kubectl apply -f deploy/k8s/
+#
+# ── 存储对应表 ────────────────────────────────────────────────────
+#   PV workbuddy-manager-data   hostPath /srv/workbuddy/manager-data
+#      → PVC workbuddy-manager-data（5Gi）→ 挂给面板的 /app/data
+#      里面放：manager.db（密钥/日志/用量/审计）、users.json（管理员与**会话签名密钥**）
+#      —— 丢了要重新初始化管理员，且已发的会话全部失效；日志与用量统计也会丢。
+#   PVC workbuddy2api-shared（在 10-upstream.yaml 里定义，本文件只是复用它）
+#      → 挂给面板的 /opt/workbuddy2api，也就是 auths/ 与 config.json
+#      面板要**读写**这里：扫码添加账号会写 auths/，设置页保存会改 config.json。
+#      这也是为什么 config.json 不能做成只读的 ConfigMap/Secret 挂载。
+#
+# ── 与 Docker 部署的差异（都是 k8s 的固有限制，不是配置没写对）─────
+#   · 面板重启上游 / 读上游日志 / 端口收敛 / 一键更新：这些靠 docker CLI + compose，
+#     k8s 里没有（容器运行时是 containerd）。官方镜像内置了 docker CLI，连不上
+#     daemon 时这几项会**降级为「请到宿主机操作」并在界面如实提示**，不会静默失败。
+#     对应的 k8s 操作：kubectl -n workbuddy rollout restart deploy/workbuddy2api
+#   · 账号与设置照常可用：加账号是写 auths/（上游每 5 秒扫一次自动进池），
+#     设置是写 config.json（改完重启一次上游生效）。
+#
+# ── 为什么面板要跟上游同节点 ──────────────────────────────────────
+#   共享卷是 ReadWriteOnce：同一块卷可以被**同一节点**上的多个 Pod 挂载，
+#   但不能跨节点。所以下面用 podAffinity 把面板钉到上游所在的节点。
+#   若你把 shared 换成 NFS/CephFS 这类 ReadWriteMany 存储，可以删掉这段亲和。
+#
+# ── 对外暴露 ──────────────────────────────────────────────────────
+#   下游客户端连的是**面板**的 /v1（密钥、配额、IP 白名单、用量日志都在面板侧），
+#   上游只跟面板对话，所以只有面板需要 Ingress。文件末尾有注释掉的示例，
+#   **务必配 TLS**：面板持有全部账号凭据。
+
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: workbuddy-manager-data
+  labels:
+    app.kubernetes.io/part-of: workbuddy
+spec:
+  capacity:
+    storage: 5Gi
+  accessModes: ["ReadWriteOnce"]
+  # Retain：删 PVC 不删数据。users.json 里的会话签名密钥丢了会让所有人重新登录，
+  # 数据库丢了统计与审计就没了 —— 都别指望它自动清理。
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  volumeMode: Filesystem
+  hostPath:
+    path: /srv/workbuddy/manager-data
+    type: DirectoryOrCreate
+  claimRef:
+    namespace: workbuddy
+    name: workbuddy-manager-data
+  # 多节点：换成 NFS / 本地盘 + nodeAffinity，写法见 10-upstream.yaml 里的注释。
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: workbuddy-manager-data
+  namespace: workbuddy
+spec:
+  storageClassName: ""
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 5Gi
+
+---
+# 管理面板的初始密码：**可选**，同样不放在清单里。
+#   · 不建 → 面板首启随机生成一个并打进容器日志：
+#       kubectl -n workbuddy logs deploy/workbuddy-manager | grep -A2 密码
+#   · 建   → 用你给的密码。必须在面板**第一次启动之前**建好；已经首启过就不生效了
+#            （密码已写进 users.json，那时改用界面的「管理用户」改）。
+#
+#   kubectl -n workbuddy create secret generic workbuddy-manager-secret \
+#     --from-literal=admin-password="$(openssl rand -base64 18)" \
+#     --dry-run=client -o yaml | kubectl apply -f -
+#
+# 同理不做进清单（会被 apply 覆盖）。想用 YAML 就取消注释下面这段：
+#
+# apiVersion: v1
+# kind: Secret
+# metadata:
+#   name: workbuddy-manager-secret
+#   namespace: workbuddy
+# type: Opaque
+# stringData:
+#   admin-password: "换成你的强密码"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: workbuddy-manager
+  namespace: workbuddy
+  labels:
+    app.kubernetes.io/name: workbuddy-manager
+    app.kubernetes.io/part-of: workbuddy
+spec:
+  replicas: 1
+  strategy:
+    # 面板与上游共用一个 RWO 卷，滚动更新会短暂出现两个 Pod 同时挂它。
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: workbuddy-manager
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: workbuddy-manager
+        app.kubernetes.io/part-of: workbuddy
+    spec:
+      # 与上游同一个 uid：跨容器读写同一个卷才不会有权限问题
+      # （官方镜像自己也用 10001，就是为了和上游对齐）。
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      affinity:
+        podAffinity:
+          # 见文件开头「为什么面板要跟上游同节点」。
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: workbuddy2api
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: workbuddy-manager
+          image: ghcr.io/ithtelab/workbuddy-manager:latest
+          imagePullPolicy: Always
+          env:
+            - name: TZ
+              value: Asia/Shanghai
+            # 上游地址：同一命名空间里直接用 Service 名。镜像里的默认值是
+            # 127.0.0.1:7863，在容器里指向自己，**必须覆盖**。
+            - name: WB2API_BASE
+              value: http://workbuddy2api:7863
+            # 首启管理员密码（留空则随机生成并打日志）。
+            - name: WB_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: workbuddy-manager-secret
+                  key: admin-password
+                  optional: true
+            # 真实 IP：Ingress 后面的反代（ingress-nginx 默认就会带 X-Real-IP）。
+            # 默认已是 1；若前面再叠一层 CDN，把它改成 CDN+反代的层数。
+            - name: WB_TRUST_PROXY
+              value: "1"
+            - name: WB_TRUSTED_PROXY_HOPS
+              value: "1"
+            # 生产环境不暴露 /docs 与 /openapi.json（默认也是 0，写出来是为了显眼）。
+            - name: WB_ENABLE_DOCS
+              value: "0"
+          ports:
+            - name: http
+              containerPort: 7864
+          # 面板自己的健康检查 /api/healthz 只返回 {'ok': true}，**不依赖上游**
+          # （源码 server/routers/auth.py），所以可以直接当探针用 ——
+          # 上游挂了面板仍然是 Ready，界面才能照常显示「上游不可用」。
+          startupProbe:
+            httpGet:
+              path: /api/healthz
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /api/healthz
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/healthz
+              port: http
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            # 面板自己的数据：SQLite + users.json。必须持久化。
+            - name: manager-data
+              mountPath: /app/data
+            # 上游目录（共享卷）：里面就是 auths/ 与 config.json 两项。
+            # 挂在这个路径是**刻意的** —— 镜像里 WB_AUTH_DIR / WB_UPSTREAM_CONFIG /
+            # WB_UPSTREAM_DIR 的默认值正好指向 /opt/workbuddy2api/*，
+            # 所以不用再设这几个环境变量。
+            - name: upstream-shared
+              mountPath: /opt/workbuddy2api
+      volumes:
+        - name: manager-data
+          persistentVolumeClaim:
+            claimName: workbuddy-manager-data
+        - name: upstream-shared
+          persistentVolumeClaim:
+            claimName: workbuddy2api-shared
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: workbuddy-manager
+  namespace: workbuddy
+  labels:
+    app.kubernetes.io/name: workbuddy-manager
+    app.kubernetes.io/part-of: workbuddy
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: workbuddy-manager
+  ports:
+    - name: http
+      port: 7864
+      targetPort: http
+
+---
+# ── 对外入口（可选，但公网使用必配 TLS）────────────────────────────
+# 面板会流式返回（SSE）：反代必须关缓冲、放宽超时，否则「流式」会被中间层
+# 攒成一整块，等于把流式白做了。
+#
+# apiVersion: networking.k8s.io/v1
+# kind: Ingress
+# metadata:
+#   name: workbuddy-manager
+#   namespace: workbuddy
+#   annotations:
+#     nginx.ingress.kubernetes.io/proxy-buffering: "off"
+#     nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+#     nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+#     # 面板的网关请求体上限是 8 MiB（WB_GATEWAY_MAX_BODY_MB），这里给足。
+#     nginx.ingress.kubernetes.io/proxy-body-size: "16m"
+# spec:
+#   ingressClassName: nginx
+#   tls:
+#     - hosts: ["wb.example.com"]
+#       secretName: workbuddy-tls
+#   rules:
+#     - host: wb.example.com
+#       http:
+#         paths:
+#           - path: /
+#             pathType: Prefix
+#             backend:
+#               service:
+#                 name: workbuddy-manager
+#                 port:
+#                   number: 7864

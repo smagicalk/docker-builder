@@ -1,0 +1,378 @@
+# 上游 workbuddy2api（OpenAI 兼容网关）—— 账号池本体。
+# 镜像来自本仓库的自动构建：ghcr.io/smagicalk/workbuddy2api:latest
+#
+# 部署顺序：先 00-namespace，再本文件，最后 20-manager（面板要连本文件的 Service）。
+#   kubectl apply -f deploy/k8s/
+#
+# ── 存储对应表（这套清单只用到两种卷，都写清了）────────────────────
+#   PV workbuddy2api-shared   hostPath /srv/workbuddy/shared
+#      → PVC workbuddy2api-shared（1Gi）→ 挂给上游的 /app/auths 与 /app/config.json
+#      → 同时挂给面板的 /opt/workbuddy2api
+#      里面放：auths/（账号凭证，丢了要重新扫码）+ config.json（可写，面板要改它）
+#      **这个卷是上游与面板共享的**，所以 PVC 与 PV 名里都带 shared。
+#   PV workbuddy2api-pool     hostPath /srv/workbuddy/upstream-pool
+#      → PVC workbuddy2api-pool（1Gi）→ 只挂给上游的 /app/data
+#      里面放：state.json（积分/冷却/熔断计数）、model.json（(账号,模型) 成本账本）
+#
+# hostPath 是最省事、最透明的选择，代价是**数据绑在节点上**：Pod 只能调度到
+# 那台有数据的节点。多节点集群请换成 NFS / 云盘 CSI（见文件末尾的两种替代写法）。
+# reclaimPolicy 一律 Retain：删 PVC **不会**删数据，要清干净得自己上节点删目录。
+#
+# ── 三个必须知道的点 ──────────────────────────────────────────────
+#   1. replicas 固定 1，别直接扩。账号池是「单进程本地状态 + 本地 auths 目录」：
+#      多副本会各自把定时任务跑一遍（重复签到/领奖，还有 WAF 风险），
+#      并争抢同一份 state.json。真要扩容，先关掉 config.json 里的 schedule.* 开关。
+#   2. 探针刻意用 TCP，不用 /healthz：/healthz 在账号池为空时返回 503（应用层语义，
+#      见上游 handler.go 的 Pool.ServableNow()）。当 liveness 会让 Pod 反复重启，
+#      当 readiness 会让「还没加账号」时 Service 不转发、连扫码加账号都做不了。
+#   3. config.json **必须是可写卷**，不能挂 ConfigMap/Secret：面板的「设置」页要
+#      就地改它。因此密钥不能只放在 Secret 里 —— 下面用 init 容器把 Secret 的
+#      api_key 同步进文件（面板、login.sh 都从这个文件读密钥）。
+
+---
+# 共享卷：auths/ + config.json。上游与面板都要挂。
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: workbuddy2api-shared
+  labels:
+    app.kubernetes.io/part-of: workbuddy
+spec:
+  capacity:
+    storage: 1Gi
+  accessModes: ["ReadWriteOnce"]
+  persistentVolumeReclaimPolicy: Retain
+  # 空字符串 = 静态供给（不走 StorageClass 动态创建）。必须与 PVC 一致。
+  storageClassName: ""
+  volumeMode: Filesystem
+  hostPath:
+    path: /srv/workbuddy/shared
+    type: DirectoryOrCreate
+  # 钉住目标 PVC：静态供给时若不加 claimRef，别的 PVC 可能先把这块 PV 抢走。
+  # 换命名空间时这里要跟着改（或删掉这三行）。
+  claimRef:
+    namespace: workbuddy
+    name: workbuddy2api-shared
+  # ── 多节点集群：把 hostPath 换成下面任一种 ──────────────────────
+  # (a) 换成本地盘 + 节点亲和（数据仍绑节点，但调度不会跑到没有盘的那台）
+  #     local:
+  #       path: /srv/workbuddy/shared
+  #     nodeAffinity:
+  #       required:
+  #         nodeSelectorTerms:
+  #           - matchExpressions:
+  #               - key: kubernetes.io/hostname
+  #                 operator: In
+  #                 values: ["node-1"]
+  # (b) 换成 NFS（此时 shared 这个卷建议改 accessModes: ["ReadWriteMany"]，
+  #     并把 20-manager.yaml 里的 podAffinity 删掉）
+  #     nfs:
+  #       server: 10.0.0.10
+  #       path: /export/workbuddy/shared
+
+---
+# 账号池状态卷：只挂给上游。
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: workbuddy2api-pool
+  labels:
+    app.kubernetes.io/part-of: workbuddy
+spec:
+  capacity:
+    storage: 1Gi
+  accessModes: ["ReadWriteOnce"]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  volumeMode: Filesystem
+  hostPath:
+    path: /srv/workbuddy/upstream-pool
+    type: DirectoryOrCreate
+  claimRef:
+    namespace: workbuddy
+    name: workbuddy2api-pool
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: workbuddy2api-shared
+  namespace: workbuddy
+spec:
+  # 与 PV 一致，都为空 = 静态供给
+  storageClassName: ""
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: workbuddy2api-pool
+  namespace: workbuddy
+spec:
+  storageClassName: ""
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+
+---
+# ⚠️ 这个 Secret **故意不放在清单里** —— 请先手动建它，再 apply 本文件。
+#    上游的 init 容器要从它取 api_key 才能启动，缺了它 Pod 起不来（会明确报错）。
+#
+#   kubectl -n workbuddy create secret generic workbuddy2api-secret \
+#     --from-literal=api_key="$(openssl rand -hex 32)" \
+#     --dry-run=client -o yaml | kubectl apply -f -
+#
+# 为什么不做成清单里的一段：那样每次 `kubectl apply -f deploy/k8s/` 都会用文件里的
+# 占位值把你刚设的真密钥覆盖回去。密钥的真源只应该有一处。
+#
+# 想坚持用 YAML 管密钥，把下面这段取消注释，并保证它排在 Deployment 之前：
+#
+# apiVersion: v1
+# kind: Secret
+# metadata:
+#   name: workbuddy2api-secret
+#   namespace: workbuddy
+# type: Opaque
+# stringData:
+#   api_key: "换成你自己的随机值（openssl rand -hex 32）"
+
+---
+# config.json 的初始模板：只在共享卷上还没有 config.json 时用一次。
+# api_key 留空，由 init 容器从上面的 Secret 填入。
+# 这里给的是上游默认基线；缺的字段会走上游内置默认值（含那套默认定时任务）。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: workbuddy2api-config-template
+  namespace: workbuddy
+data:
+  config.json: |
+    {
+      "listen": ":7863",
+      "api_key": "",
+      "auth_dir": "./auths",
+      "state_file": "./data/state.json",
+      "cooldown": {
+        "soft_rate": "600s",
+        "soft_rate_max": "2h"
+      },
+      "schedule": {
+        "checkin_hours": [9, 21],
+        "travel_hours": [9, 21],
+        "activity_hours": [10],
+        "keepalive_hours": [22],
+        "school_hours": [12],
+        "cat_hours": [1],
+        "checkin_enabled": true,
+        "travel_enabled": true,
+        "activity_enabled": true,
+        "keepalive_enabled": true,
+        "school_enabled": true,
+        "cat_enabled": true
+      },
+      "admin": {
+        "enabled": false
+      },
+      "global": {
+        "enabled": true,
+        "chat_base": "",
+        "billing_base": ""
+      },
+      "upstream": {
+        "timeout_seconds": 120,
+        "header_timeout_seconds": 120,
+        "idle_timeout_seconds": 300,
+        "user_agent": "",
+        "client_version": "",
+        "cli_version": "",
+        "device_token": "",
+        "device_token_file": "",
+        "client_name": "WorkBuddy",
+        "passthrough_ip": false
+      },
+      "features": {
+        "sanitize_blacklist_fingerprints": true
+      },
+      "prompt": {
+        "mode": "passthrough",
+        "file": ""
+      },
+      "upstash": {
+        "url": "",
+        "token": ""
+      },
+      "pool": {
+        "max_in_flight": 3,
+        "max_in_flight_global": 2,
+        "breaker_threshold": 3,
+        "breaker_cooldown": "30m",
+        "breaker_cooldown_max": "6h",
+        "degrade_threshold": 5,
+        "degrade_cooldown": "10m",
+        "degrade_cooldown_max": "2h",
+        "idle_weight_per_hour": 0.5,
+        "idle_weight_max": 5.0,
+        "expiring_soon": "168h",
+        "cost_explore_interval": "30m"
+      },
+      "session_sticky": {
+        "enabled": true,
+        "ttl": "30m",
+        "gc_interval": "5m"
+      }
+    }
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: workbuddy2api
+  namespace: workbuddy
+  labels:
+    app.kubernetes.io/name: workbuddy2api
+    app.kubernetes.io/part-of: workbuddy
+spec:
+  # 见文件开头第 1 条：账号池是单实例的本地状态，别扩。
+  replicas: 1
+  strategy:
+    # 不用 RollingUpdate：滚动时新旧 Pod 会同时持有同一份 state.json。
+    # 宁可停一下再起。
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: workbuddy2api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: workbuddy2api
+        app.kubernetes.io/part-of: workbuddy
+    spec:
+      # 镜像本身就是 uid 10001(app)；fsGroup 让 PV 目录直接可写 ——
+      # 等价于 Docker 部署里的 chown -R 10001:10001 auths data。
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      initContainers:
+        - name: prepare-shared
+          image: ghcr.io/smagicalk/workbuddy2api:latest
+          imagePullPolicy: Always
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              # auths 子目录必须先存在：主容器用 subPath 挂它，subPath 指向不存在
+              # 的目录会直接挂载失败，而 hostPath 只保证卷根目录存在。
+              mkdir -p /shared/auths
+              # 首次启动：用 ConfigMap 模板生成 config.json
+              if [ ! -f /shared/config.json ]; then
+                echo "[init] 共享卷上还没有 config.json，从模板生成"
+                cp /template/config.json /shared/config.json
+              fi
+              # 把 api_key 同步成 Secret 里的值。只在这一处写文件，避免
+              # 「Secret 与文件各说一套」；面板与 login.sh 都读这个文件。
+              python3 -c "import json,os;p='/shared/config.json';c=json.load(open(p));c['api_key']=os.environ['API_KEY'];json.dump(c,open(p,'w'),ensure_ascii=False,indent=2);print('[init] api_key 已同步自 Secret')"
+              echo "[init] 共享卷就绪"
+          env:
+            - name: API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: workbuddy2api-secret
+                  key: api_key
+          volumeMounts:
+            - name: shared
+              mountPath: /shared
+            - name: template
+              mountPath: /template
+              readOnly: true
+      containers:
+        - name: workbuddy2api
+          image: ghcr.io/smagicalk/workbuddy2api:latest
+          # 上游换附件后本仓库会重建镜像，标签仍是 latest：必须每次拉取，
+          # 否则节点上会一直复用旧镜像。
+          imagePullPolicy: Always
+          # 要可复现（不被下一次上游重建影响）就钉内容寻址标签：
+          #   image: ghcr.io/smagicalk/workbuddy2api:sha256-6d3582fcedbb
+          env:
+            # 定时任务里「几点执行」按进程本地时区判定（上游 nowFunc = time.Now），
+            # 固定 CST 让 config.json 里的 9 / 21 点就是北京时间。
+            - name: TZ
+              value: Asia/Shanghai
+          ports:
+            - name: http
+              containerPort: 7863
+          # 启动可能因为账号多而稍慢，用 startupProbe 挡住 liveness，免得启动期被误判重启。
+          startupProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              # 流式转发是 IO 密集，CPU 上限过紧会拖慢首字延迟，按机器调整。
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            # 账号凭证：扫码落盘、令牌刷新都是 tmp+rename 回写，必须可写。
+            - name: shared
+              mountPath: /app/auths
+              subPath: auths
+            # 配置：只读挂给上游（它不写这个文件），写权限留给面板。
+            - name: shared
+              mountPath: /app/config.json
+              subPath: config.json
+              readOnly: true
+            - name: pool
+              mountPath: /app/data
+      volumes:
+        - name: shared
+          persistentVolumeClaim:
+            claimName: workbuddy2api-shared
+        - name: pool
+          persistentVolumeClaim:
+            claimName: workbuddy2api-pool
+        - name: template
+          configMap:
+            name: workbuddy2api-config-template
+
+---
+# 只集群内可达。下游客户端应该连**面板**的 /v1（密钥、配额、日志都在面板侧），
+# 而不是直连这里；上游只跟面板对话，因此不需要对外发布。
+apiVersion: v1
+kind: Service
+metadata:
+  name: workbuddy2api
+  namespace: workbuddy
+  labels:
+    app.kubernetes.io/name: workbuddy2api
+    app.kubernetes.io/part-of: workbuddy
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: workbuddy2api
+  ports:
+    - name: http
+      port: 7863
+      targetPort: http
