@@ -264,7 +264,7 @@ kubectl -n workbuddy logs deploy/workbuddy -c workbuddy-manager | grep -A2 密�
 kubectl -n workbuddy port-forward svc/workbuddy-manager 7864:7864
 ```
 
-四块卷都是 `hostPath`（路径固定、`Retain` 不自动删），**前两块被两个容器共享**：
+四块卷都是 `hostPath`（路径固定、`Retain` 不自动删），**前两块被两个容器共享**——多节点集群必须给 PV 钉节点或换 CSI，见 [`deploy/k8s/README.md`](deploy/k8s/README.md)：
 
 | 卷 | 宿主机路径 | 挂给谁 | 里面是什么 |
 |---|---|---|---|
@@ -295,6 +295,7 @@ kubectl -n workbuddy rollout restart deploy/workbuddy
 | 两个容器 | 同一个 Pod | 共享 RWO 卷不需要 `podAffinity`（同一个 Pod 不可能跨节点）；面板可直接连 `127.0.0.1:7863` |
 | 同 Pod 的代价 | Pod Ready 聚合、镜像拉取是单点、只能整 Pod 重启 | 上游容器崩了，面板的 Service 也会失去 endpoint —— 更看重「面板独立可用」就按 README 里的「拆成两套部署」拆开 |
 | 卷属主 | `fsGroup: 10001` | 等价于 Docker 那步 `chown -R 10001:10001`，不用手工改 |
+| hostPath 与多节点 | 四个 PV 都要加 `nodeAffinity` 钉到**同一台**节点，或改用 CSI 存储 | 不钉的话 Pod 落到别的节点会看到空目录：账号池变 0、配置回默认基线 —— 很像数据丢了（数据其实在另一台上） |
 | 上游探针 | **TCP 探针**，不用 `/healthz` | `/healthz` 空池返回 503：当 liveness 会反复重启，当 readiness 会让加账号都做不了 |
 | 面板探针 | `httpGet /api/healthz` | 该接口只返回 `{ok: true}`、不依赖上游，所以上游挂了面板仍 Ready |
 | 容器端口名 | 上游 `api` / 面板 `web` | 同一个 Pod 里两个容器都有 http 端口时，Service 用命名端口会分不清该指向谁 |

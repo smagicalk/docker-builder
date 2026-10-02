@@ -178,6 +178,31 @@ kubectl -n workbuddy create secret generic workbuddy2api-secret \
 kubectl -n workbuddy rollout restart deploy/workbuddy
 ```
 
+## 多节点集群：hostPath 必须钉节点
+
+`hostPath` 的数据只存在于**一个节点**上，而 Pod 可以调度到任何节点。落到没有数据的那台时，
+你会看到：账号池变 0（`auths/` 是空的）、配置回到默认基线（init 又写了一份）—— 很像数据丢了，
+其实数据好好地在另一台上。多节点集群里二选一：
+
+**① 钉节点**（最小改动）：给四个 PV 都加上 `nodeAffinity`，值填 `kubectl get nodes` 里那个
+`NAME`，**四个必须是同一台**（钉到不同节点会让 Pod 永远 `Pending`）：
+
+```yaml
+spec:
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values: ["有数据的那台节点名"]
+```
+
+然后保证 `/srv/workbuddy/upstream/{config,auths,pool}` 与 `/srv/workbuddy/manager/data`
+都在那一台上。
+
+**② 换 CSI 存储**（推荐做法）：按下一节把宿主机路径换成 NFS / 云盘 CSI，Pod 就能到处跑。
+
 ## 换成 NFS / 云盘（动态供给）
 
 默认 `hostPath` 最省事，但数据绑在节点上。多节点集群按需替换：
@@ -227,6 +252,7 @@ kubectl -n workbuddy rollout restart deploy/workbuddy
 ## 常见坑
 
 | 现象 | 原因 |
+| 账号池突然变 0、配置回到默认基线 | Pod 被调度到了**另一台节点** —— hostPath 的数据在那台上是空的（init 于是又写了一份新基线）。给四个 PV 加 `nodeAffinity` 钉住有数据的那台，或改用 CSI 存储；见「多节点集群」一节 |
 |---|---|
 | PV 一直 `Pending` / PVC 绑不上 | `claimRef.namespace` 写错（换过命名空间？），或 PV 与 PVC 的 `storageClassName` 不一致 —— 静态供给时两边必须**同时**为空字符串或同时填同一个名字 |
 | Pod `CreateContainerConfigError` | 少了 `workbuddy2api-secret`（两个容器都要它） |

@@ -45,9 +45,11 @@
 #
 # 密钥不在这四块卷里：由 Secret 经 WB2A_API_KEY / WB2API_KEY 注入（文件里的 api_key 恒为空）。
 #
-# hostPath 最省事、最透明，代价是**数据绑在节点上**（Pod 只能调度到有数据的那台）。
-# 多节点集群换成 NFS / 云盘 CSI —— 那是动态供给，把本文件的 PV 全删掉、给 PVC 填上
-# storageClassName 即可（写法见 deploy/k8s/README.md）。
+# hostPath 最省事、最透明，代价是**数据绑在节点上**：多节点集群里 Pod 可能被调度到另一台
+# 节点，那里看到的是空目录 —— 表现为「账号池变 0、配置回到默认基线」，很像数据丢了。
+# 所以多节点集群必须二选一（写法见 deploy/k8s/README.md 的「多节点集群」一节）：
+#   · 给下面四个 PV 都加 nodeAffinity，把 Pod 钉在有数据的那一台；或
+#   · 换成 NFS / 云盘 CSI（动态供给）：把本文件的 PV 全删掉、给 PVC 填上 storageClassName。
 # reclaimPolicy 一律 Retain：删 PVC **不会**删数据，要清干净得自己上节点删目录。
 #
 # ── 五个必须知道的点 ──────────────────────────────────────────────
@@ -278,6 +280,12 @@ spec:
       # 初始化容器：配置卷（hostPath）初始是空目录，而两个容器都用 subPath 挂**单个文件**，
       # 文件不存在会直接挂载失败 —— 所以先由它写一份默认基线出来。
       # 只写一次：之后这个文件就是配置的唯一真源（面板保存的内容不会被覆盖）。
+      # 为什么非写不可：上游在配置文件缺失时**不会**退回默认值 —— 源码 cmd/server/main.go
+      # 里本来有 os.IsNotExist 兜底（退回「默认值 + env」），但 Load() 把错误包成了
+      # fmt.Errorf("read config: %w", err)，而 os.IsNotExist 只解 PathError/LinkError/
+      # SyscallError 这类包装、认不出 fmt.wrapError → 兜底永不触发 → log.Fatalf → 容器
+      # 以退出码 1 结束（已在真镜像里实测到那行 "load config: read config: open ...:
+      # no such file or directory"）。上游哪天修了这个 %w，这个 init 才可以去掉。
       initContainers:
         - name: init-config
           image: ghcr.io/smagicalk/workbuddy2api:latest
