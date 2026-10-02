@@ -1,4 +1,4 @@
-# 用「预构建镜像」跑上游 workbuddy2api（对应仓库 README 的「拉下来怎么跑」）。
+# 用「预构建镜像」跑上游 workbuddy2api（完整手册见同目录 README.md）。
 #
 # 与上游自带那份 docker-compose.yml 的差别只有一处：把 build: . 换成了 image:，
 # 也就是不再本地编译，直接用 CI 打好的镜像。其余（端口、卷、运行身份、配置文件

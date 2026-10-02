@@ -1,6 +1,7 @@
 # Kubernetes 部署清单
 
-**只看这个目录 + 仓库根目录的 `docker-compose.yml`，就能把整套 WorkBuddy 跑起来。**
+**只看这个目录 + [`../workbuddy2api/`](../workbuddy2api/README.md) 与 [`../workbuddy-manager/`](../workbuddy-manager/README.md)，就能把整套 WorkBuddy 跑起来。**
+（那两个文件夹分别是「上游怎么跑」与「面板怎么配」的手册；K8s 里两者被放进同一个 Pod。）
 
 上游网关与面板放在**同一个 Deployment（同一个 Pod）**里，两个容器：
 
@@ -32,6 +33,22 @@
 - **镜像拉取是单点**：两个容器都是 `:latest` + `Always`，任一方在 registry 抖动或被删 tag
   → Pod 起不来 → 两个一起不可用；
 - **重启粒度粗**：只能整 Pod（改完配置要 `rollout restart`，面板跟着断几秒）。
+
+## 关键设计一览
+
+细节在各节，这是速查（总体取舍见上一节）：
+
+| 点 | 做法 | 为什么 |
+|---|---|---|
+| 上游副本数 | **固定 `replicas: 1`** + `strategy: Recreate` | 账号池是单进程本地状态：多副本会各自跑一遍定时任务并争抢同一份 `state.json` |
+| 配置生效 | 上游容器里跑一个 supervisor（清单里的 `command/args`），盯 `config.json` 的内容哈希 | 「保存即生效」（2~5 秒），不必重启 Pod、面板不中断 —— 见「配置为什么能『保存即生效』」 |
+| 成长任务脚本 | init 容器从**上游镜像**复制 `/app/scripts/*.py` 到共享卷（emptyDir） | 面板「成长中心任务」可用，脚本版本与上游容器永远一致；复制失败只降级该功能，不挡 Pod 启动 |
+| 卷属主 | `fsGroup: 10001` | 等价于 Docker 那步 `chown -R 10001:10001`，不用手工改 |
+| hostPath 与多节点 | 四个 PV 都要加 `nodeAffinity` 钉到**同一台**节点，或改用 CSI 存储 | 不钉的话 Pod 落到别的节点会看到空目录：账号池变 0、配置回默认基线 —— 很像数据丢了 |
+| 上游探针 | **TCP 探针**，不用 `/healthz` | `/healthz` 空池返回 503：当 liveness 会反复重启，当 readiness 会让加账号都做不了 |
+| 面板探针 | `httpGet /api/healthz` | 该接口只返回 `{ok: true}`、不依赖上游，所以上游挂了面板仍 Ready |
+| 容器端口名 | 上游 `api` / 面板 `web` | 同一个 Pod 里两个容器都有 http 端口时，Service 用命名端口会分不清该指向谁 |
+| api_key | Secret 是唯一真源 | 两处都指向同一个 Secret，不会各说一套；`config.json` 里的 api_key 恒被忽略 |
 
 ## 文件与顺序
 

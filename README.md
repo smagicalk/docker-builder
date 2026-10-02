@@ -10,7 +10,7 @@
 本仓库把这件事自动化：**定时盯着那个附件，一变就自动构建并推送镜像。**
 
 > **本仓库不含上游源码。** 源码只在构建时从 Release 附件现取，用完即弃。
-> 这里只有一份 workflow、一份给消费端用的 compose 和这份说明。
+> 这里只有一份 workflow、`deploy/` 下的部署说明与 compose，和这份说明。
 
 ---
 
@@ -125,184 +125,25 @@ gh workflow run workbuddy2api.yml -f force=true    # 强制重新构建
 
 ---
 
-## 怎么跑起来（Docker）
+## 部署与运行（都在 `deploy/` 下）
 
-上游自带的 `docker-compose.yml` 是**本地构建**的（`build: .`）。要用这份预构建镜像，
-就把 compose 换成仓库根目录的 [`docker-compose.yml`](docker-compose.yml)（只有 `image:`、
-没有 `build:`），或把那两个字段替换掉。
+本仓库只管**打包上游镜像**；怎么把它跑起来（以及官方面板怎么配），按组件分在三个文件夹里，
+每份都能独立看：
 
-### 1. 准备三样东西
+| 目录 | 内容 |
+|---|---|
+| [`deploy/workbuddy2api/`](deploy/workbuddy2api/README.md) | 上游网关怎么跑：`docker-compose.yml`（只有 `image:`）+ 手册（准备 config / auths / data、属主 10001、起服务、扫码加号、验证、升级） |
+| [`deploy/workbuddy-manager/`](deploy/workbuddy-manager/README.md) | 官方**面板**怎么配：环境变量、怎么连上游、`docker.sock` 挂不挂差在哪、让面板接管 Docker 部署的上游 |
+| [`deploy/k8s/`](deploy/k8s/README.md) | Kubernetes：上游 + 面板**同一个 Pod** 的完整清单（4 PV/PVC、init 容器、2 Service、注释版 Ingress）与全部坑位 |
 
-| 东西 | 作用 | 注意 |
-|---|---|---|
-| `config.json` | 上游配置 | **至少设 `api_key`** |
-| `auths/` | 账号凭证 | **丢了要重新扫码** |
-| `data/` | 账号池状态（`state.json` + 模型账本） | 丢了不致命，但冷却状态与便宜号账本要重新学 |
+三者的关系一句话：上游镜像由**本仓库**构建 →
+[`deploy/workbuddy2api/`](deploy/workbuddy2api/README.md) 讲怎么单独跑它 →
+[`deploy/workbuddy-manager/`](deploy/workbuddy-manager/README.md) 讲面板怎么跟它配对 →
+[`deploy/k8s/`](deploy/k8s/README.md) 把两者放进一个 Pod（共享 `config.json` 与 `auths/`，
+面板的「扫码加号」「设置页保存」「成长中心任务」在那边才是完整可用的）。
 
-最小可用的 `config.json` —— **缺的字段全走上游默认值**（包括那套 9/21 点签到、
-22 点保活的默认定时任务），所以写这四个键就能跑：
-
-```json
-{
-  "listen": ":7863",
-  "api_key": "把 `openssl rand -hex 32` 的结果贴这里",
-  "auth_dir": "./auths",
-  "state_file": "./data/state.json"
-}
-```
-
-`api_key` **留空 = 完全不鉴权**，公网部署等于把账号池敞开。想要带全部字段的带注释基线，
-从 Release 附件里取一份 `config.example.json`（注意示例里的 `test_key` 只是占位符）：
-
-```bash
-curl -fsSL https://github.com/ithtelab/workbuddy-manager/releases/download/upstream-src/workbuddy2api-src.tar.gz \
-  | tar xz --strip-components=1 --wildcards '*/config.example.json'
-```
-
-### 2. 把两个目录的属主交给 10001
-
-容器以 `app(uid 10001)` 运行。目录属主不对的话，账号数会一直是 0 而且**不报错** ——
-这是最容易踩的一步：
-
-```bash
-chown -R 10001:10001 auths data
-```
-
-### 3. 起服务
-
-```bash
-docker compose up -d
-docker compose logs -f      # 出现 "listening on :7863 (api_key=true)" 就是好了
-```
-
-> 日志里那个 `api_key=true` 就是**鉴权状态**：显示 `false` 说明你没设密钥、
-> 接口对任何人开放。
-
-不用 compose 的话，等价的一条命令：
-
-```bash
-docker run -d --name workbuddy2api --restart unless-stopped \
-  -e TZ=Asia/Shanghai \
-  -p 127.0.0.1:7863:7863 \
-  -v "$PWD/auths:/app/auths" \
-  -v "$PWD/data:/app/data" \
-  -v "$PWD/config.json:/app/config.json:ro" \
-  ghcr.io/smagicalk/workbuddy2api:latest
-```
-
-> 固定 `TZ=Asia/Shanghai` 是必要的：定时任务里「几点执行」按进程本地时区判定，
-> 不设就按容器默认的 UTC 走，配置里的 `9 / 21` 点会变成北京时间 17 点 / 次日 5 点。
-
-### 4. 加账号（扫码）
-
-**要在容器内登录**：第 2 步把 `auths/` 交给 10001 之后，宿主机侧跑 `./login.sh` 会被
-脚本自带的可写性预检直接拦下（不会白走一遍授权）。容器内的 `app` 自己落盘，属主天然正确：
-
-```bash
-docker compose exec -it workbuddy2api ./login.sh --realm=cn
-# 国际版：--realm=global；不带参数且 stdin 是 tty 时会交互式问你要哪个域
-```
-
-按提示在浏览器里完成授权。加完**不用重启** —— 网关每 5 秒扫一次 `auths/`，新凭证自动进池
-（日志会打 `新增账号自动加载，无需重启`）。
-
-### 5. 验证
-
-```bash
-curl -s http://127.0.0.1:7863/healthz          # 无需鉴权
-# {"healthy":1,"realm_servable":{"cn":true,"global":true},"service":"workbuddy2api","total":1}
-
-K=<你的 api_key>
-curl -s -H "Authorization: Bearer $K" http://127.0.0.1:7863/status
-curl -s -H "Authorization: Bearer $K" http://127.0.0.1:7863/v1/models
-
-curl -s http://127.0.0.1:7863/v1/chat/completions \
-  -H "Authorization: Bearer $K" -H 'Content-Type: application/json' \
-  -d '{"model":"glm-5.2","messages":[{"role":"user","content":"你好"}]}'
-```
-
-`/healthz` 里的 `healthy` / `total` 就是账号数。**账号池为空时它返回 503、`docker ps`
-会显示 unhealthy** —— 这是上游的设计（用 `Pool.ServableNow()` 判「能不能受理请求」），
-加进第一个账号就变 200，不是镜像坏了。
-
-### 6. 更新镜像
-
-```bash
-docker compose pull && docker compose up -d
-```
-
-上游源码换新后本仓库会自动重建镜像（见上面「两种触发方式」），你这边 `pull` 一次即可；
-`auths/` 与 `data/` 在卷里，升级不碰它们。
-
-### 想让 workbuddy-manager 面板管它
-
-面板的 `deploy/install.sh` 会对上游目录跑 `docker compose up -d --build`。把上游目录里的
-compose 换成只有 `image:` 的版本即可（`--build` 对没有 `build:` 段的服务是空操作，
-会直接用已拉取的镜像），`config.json` / `auths/` / `data/` 照旧保留。
-
----
-
-## 在 Kubernetes 里跑（上游 + 面板同一个 Pod）
-
-清单在 [`deploy/k8s/`](deploy/k8s/)。**两个容器放进同一个 Deployment**：上游网关与面板
-共用一个 Pod，于是可以挂同一块卷 —— 面板那两项「天生要靠直接读写上游文件」的功能
-（扫码加号、设置页保存）就都能用了。
-
-```bash
-# 1) 命名空间 + 密钥。Secret 是命名空间级的，而且**刻意不放进清单** ——
-#    放进清单会被 apply 用占位值把你的真密钥覆盖回去
-kubectl apply -f deploy/k8s/00-namespace.yaml
-kubectl -n workbuddy create secret generic workbuddy2api-secret \
-  --from-literal=api_key="$(openssl rand -hex 32)" \
-  --dry-run=client -o yaml | kubectl apply -f -
-
-# 2) 整套（4 PV/PVC + 两个容器 + 2 Service；配置由 init 容器在首次部署时写一份默认基线）
-kubectl apply -f deploy/k8s/10-stack.yaml
-
-# 3) 打开面板：首启随机密码在日志里（建了 manager-secret 就是你给的那个）
-kubectl -n workbuddy logs deploy/workbuddy -c workbuddy-manager | grep -A2 密码
-kubectl -n workbuddy port-forward svc/workbuddy-manager 7864:7864
-```
-
-四块卷都是 `hostPath`（路径固定、`Retain` 不自动删），**前两块被两个容器共享**——多节点集群必须给 PV 钉节点或换 CSI，见 [`deploy/k8s/README.md`](deploy/k8s/README.md)：
-
-| 卷 | 宿主机路径 | 挂给谁 | 里面是什么 |
-|---|---|---|---|
-| `workbuddy2api-config` 1Gi | `/srv/workbuddy/upstream/config` | 上游 `/app/config.json`（只读）＋ 面板 `/opt/workbuddy2api/config.json`（读写） | `config.json`（上游全部配置） |
-| `workbuddy2api-auths` 1Gi | `/srv/workbuddy/upstream/auths` | 上游 `/app/auths` ＋ 面板 `/opt/workbuddy2api/auths` | 账号凭证（**最该备份的**） |
-| `workbuddy2api-pool` 1Gi | `/srv/workbuddy/upstream/pool` | 上游 `/app/data` | `state.json`、成本账本 |
-| `workbuddy-manager-data` 5Gi | `/srv/workbuddy/manager/data` | 面板 `/app/data` | SQLite 库、`users.json` |
-
-`config.json` 里没有任何密钥：`api_key` 由 Secret 经 `WB2A_API_KEY`（上游）与
-`WB2API_KEY`（面板）注入，文件里留空即可。
-
-**配置改动「保存即生效」**：上游只在**进程启动时**读一次配置（源码 `cmd/server/main.go` 里只有
-一次 `Load`，没有 fsnotify、没有 SIGHUP），所以清单给上游容器套了一个几十行的 supervisor
-（就是那个容器的 `command/args`，**不碰上游代码**）：它盯住 `config.json` 的内容哈希，一变就
-优雅重启上游进程（SIGTERM → 上游落盘 state 并等在途请求结束）。本地实跑验证：保存后
-**2~5 秒**生效，面板与整个 Pod 都不受影响。
-
-**加账号不用重启**：上游每 5 秒重扫 `auths/`（`internal/pool/watch.go`），面板扫码写进去就进池。
-细节与全部坑位见 [`deploy/k8s/README.md`](deploy/k8s/README.md)。
-
-几处刻意的设计（理由都写在清单注释里）：
-
-| 点 | 做法 | 为什么 |
-|---|---|---|
-| 上游副本数 | **固定 `replicas: 1`** + `strategy: Recreate` | 账号池是单进程本地状态：多副本会各自跑一遍定时任务并争抢同一份 `state.json` |
-| 两个容器 | 同一个 Pod | 共享 RWO 卷不需要 `podAffinity`（同一个 Pod 不可能跨节点）；面板可直接连 `127.0.0.1:7863` |
-| 同 Pod 的代价 | Pod Ready 聚合、镜像拉取是单点、只能整 Pod 重启 | 上游容器崩了，面板的 Service 也会失去 endpoint —— 更看重「面板独立可用」就按 README 里的「拆成两套部署」拆开 |
-| 配置生效 | 上游容器里跑一个 supervisor（清单里的 `command/args`），盯 `config.json` 的内容哈希，一变就优雅重启上游进程 | 「保存即生效」（2~5 秒），不必重启 Pod、面板不中断；上游的优雅停机保证不掐断在途请求 |
-| 成长任务脚本 | init 容器从**上游镜像**复制 `/app/scripts/*.py` 到共享卷（emptyDir），面板按官方说的「源码部署」路径找到它 | 面板「成长中心任务」在 K8s 下可用，且脚本版本与上游容器永远一致；复制失败只降级这一个功能，不挡 Pod 启动（实测 `available: true`） |
-| 卷属主 | `fsGroup: 10001` | 等价于 Docker 那步 `chown -R 10001:10001`，不用手工改 |
-| hostPath 与多节点 | 四个 PV 都要加 `nodeAffinity` 钉到**同一台**节点，或改用 CSI 存储 | 不钉的话 Pod 落到别的节点会看到空目录：账号池变 0、配置回默认基线 —— 很像数据丢了（数据其实在另一台上） |
-| 上游探针 | **TCP 探针**，不用 `/healthz` | `/healthz` 空池返回 503：当 liveness 会反复重启，当 readiness 会让加账号都做不了 |
-| 面板探针 | `httpGet /api/healthz` | 该接口只返回 `{ok: true}`、不依赖上游，所以上游挂了面板仍 Ready |
-| 容器端口名 | 上游 `api` / 面板 `web` | 同一个 Pod 里两个容器都有 http 端口时，Service 用命名端口会分不清该指向谁 |
-| api_key | Secret 是唯一真源 | 两处都指向同一个 Secret，不会各说一套；`config.json` 里的 api_key 恒被忽略 |
-
----
-
+> 只想在单机上跑（不碰 Kubernetes）：看前两个文件夹就够 —— 上游一个 compose，面板一个官方
+> compose（或 `docker run`），两者用同一个 Docker 网络互通。
 ## 注意
 
 - **这不是官方镜像。** 上游源码的许可为 MIT，版权归原作者（**Sliverkiss**）；
