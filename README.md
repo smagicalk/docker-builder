@@ -242,12 +242,12 @@ compose 换成只有 `image:` 的版本即可（`--build` 对没有 `build:` 段
 
 ---
 
-## 在 Kubernetes 里跑（面板 + 上游一套齐）
+## 在 Kubernetes 里跑（两套独立部署）
 
-清单在 [`deploy/k8s/`](deploy/k8s/) —— **两个组件都有**：上游网关（本仓库构建的镜像）
-与官方发布的管理面板，各自带 PersistentVolume / PersistentVolumeClaim。
-存储对应表、换成 NFS / 云盘、常见坑都写在
-[`deploy/k8s/README.md`](deploy/k8s/README.md)。
+清单在 [`deploy/k8s/`](deploy/k8s/)。**上游与面板是两套独立的部署**：各带自己的
+PersistentVolume、各自的 Service 与 Deployment，面板**不挂上游的任何目录**，
+只通过 Service 走 HTTP 连过去（`WB2API_BASE=http://workbuddy2api:7863`）——
+所以两边互不等待，各自调度、各自升级重启。
 
 ```bash
 # 1) 命名空间 + 密钥。Secret 是命名空间级的，而且**刻意不放进清单** ——
@@ -260,35 +260,47 @@ kubectl -n workbuddy create secret generic workbuddy2api-secret \
 # 2) 上游 + 面板
 kubectl apply -f deploy/k8s/10-upstream.yaml deploy/k8s/20-manager.yaml
 
-# 3) 扫码加账号、打开面板（首启随机密码在日志里）
+# 3) 加账号、打开面板（首启随机密码在日志里）
 kubectl -n workbuddy exec -it deploy/workbuddy2api -- ./login.sh --realm=cn
 kubectl -n workbuddy logs deploy/workbuddy-manager | grep -A2 密码
 kubectl -n workbuddy port-forward svc/workbuddy-manager 7864:7864
 ```
 
-三块卷都是 `hostPath`（路径固定、`Retain` 不自动删），对应关系一览：
+四块卷都是 `hostPath`（路径固定、`Retain` 不自动删）、**每个组件各自独享**：
 
 | 卷 | 宿主机路径 | 挂给谁 | 里面是什么 |
 |---|---|---|---|
-| `workbuddy2api-shared` 1Gi | `/srv/workbuddy/shared` | 上游 `/app/auths` + `/app/config.json`；面板 `/opt/workbuddy2api` | 账号凭证 + 配置（**两个组件共享**这个卷） |
-| `workbuddy2api-pool` 1Gi | `/srv/workbuddy/upstream-pool` | 上游 `/app/data` | `state.json`、成本账本 |
-| `workbuddy-manager-data` 5Gi | `/srv/workbuddy/manager-data` | 面板 `/app/data` | SQLite 库、`users.json` |
+| `workbuddy2api-config` 1Gi | `/srv/workbuddy/upstream/config` | 上游 `/app/config.json` | `config.json`（全部配置） |
+| `workbuddy2api-auths` 1Gi | `/srv/workbuddy/upstream/auths` | 上游 `/app/auths` | 账号凭证（**最该备份的**） |
+| `workbuddy2api-pool` 1Gi | `/srv/workbuddy/upstream/pool` | 上游 `/app/data` | `state.json`、成本账本 |
+| `workbuddy-manager-data` 5Gi | `/srv/workbuddy/manager/data` | 面板 `/app/data` | SQLite 库、`users.json` |
+
+**拆开部署的代价**（原因在上游的设计里：它既没有「加账号」的 HTTP 接口，也没有
+热改配置的接口，那两项天生要靠直接读写上游的文件）：
+
+| 面板功能 | 拆开后 | 替代做法 |
+|---|---|---|
+| 扫码「添加账号」 | ✗ 按钮报错 | 上游容器内执行 `./login.sh --realm=cn` |
+| 「设置」页保存 | ✗ 报错并锁定保存 | `kubectl cp` 改 `config.json` 再重启上游 |
+| 重启上游 / 读上游日志 / 一键更新 / 端口收敛 | ✗ 降级提示（k8s 里没有 docker 守护进程） | `kubectl -n workbuddy logs`、`rollout restart` |
+| 仪表盘、账号列表、密钥、日志、用量、IP 管控、模型中心、测试台 | ✓ 照常 | 只走 HTTP，不受影响 |
+
+> 那两处报错是**预期**的：面板的设计是「读失败就明确报原因并锁定保存」，
+> 不会用空配置覆盖真实文件。**别**用 emptyDir 把路径造出来骗过它 —— 那会让保存
+> 看起来成功了、上游却读不到。有 RWX 存储（NFS / CephFS / Longhorn）的话可以切回
+> 共享卷模式把那两项能力找回来，改法写在
+> [`deploy/k8s/README.md`](deploy/k8s/README.md)。
 
 几处刻意的设计（理由都写在清单注释里）：
 
 | 点 | 做法 | 为什么 |
 |---|---|---|
 | 上游副本数 | **固定 `replicas: 1`** + `strategy: Recreate` | 账号池是单进程本地状态：多副本会各自跑一遍定时任务并争抢同一份 `state.json` |
-| 共享卷 | 面板用 `podAffinity` 钉在上游所在节点 | 共享卷是 RWO（同节点多 Pod 可挂、跨节点不行），而 `config.json` 又必须可写 |
+| 面板与上游 | 不共享卷、无 `podAffinity` | 拆开部署后才能独立调度与升级：上游没起来，面板照样 Running 并显示「上游不可用」 |
 | 卷属主 | `fsGroup: 10001` | 等价于 Docker 那步 `chown -R 10001:10001`，不用手工改 |
 | 上游探针 | **TCP 探针**，不用 `/healthz` | `/healthz` 空池返回 503：当 liveness 会反复重启，当 readiness 会让加账号都做不了 |
-| 面板探针 | `httpGet /api/healthz` | 该接口只返回 `{ok: true}`、不依赖上游，所以上游挂了面板仍 Ready，界面才能显示「上游不可用」 |
-| api_key | Secret 为真源，上游 init 容器每次启动同步进 `config.json` | 文件必须可写（面板要改它）而 Secret 挂载只读；这样面板与 `login.sh` 读到的总是同一份值 |
-
-k8s 里没有 docker 守护进程，面板的「重启上游 / 读上游日志 / 一键更新 / 端口收敛」
-会降级为「请到宿主机操作」并如实提示，替代命令是
-`kubectl -n workbuddy rollout restart deploy/workbuddy2api`；
-**账号管理、密钥、日志、用量、IP 管控、模型中心、测试台照常可用**。
+| 面板探针 | `httpGet /api/healthz` | 该接口只返回 `{ok: true}`、不依赖上游，所以上游挂了面板仍 Ready |
+| api_key | Secret 是唯一真源：上游 init 容器每次启动写进 `config.json`，面板读 `WB2API_KEY` | 上游的 `login.sh` 只认文件，面板要能鉴权；同一个 Secret 才不会各说一套 |
 
 ---
 
