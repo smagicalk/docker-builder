@@ -289,8 +289,11 @@ kubectl -n workbuddy port-forward svc/workbuddy-manager 7864:7864
 > （`server/services/tencent.py` 的 `write_auth_file`），而镜像里 `/opt/workbuddy2api`
 > 本来就存在 —— 于是它会写进面板容器自己那层临时文件系统。清单里给该路径挂了
 > **只读空卷**，写入会立刻失败、当场暴露（**别**换成可写的 emptyDir）。
-> 有 RWX 存储（NFS / CephFS / Longhorn）的话可以切回共享卷模式把这四项能力找回来，
-> 改法写在 [`deploy/k8s/README.md`](deploy/k8s/README.md)。
+> 有 RWX 存储（NFS / CephFS / Longhorn）时可以**只共享 `auths/`** 找回「加账号」——
+> 上游对它**热加载**（每 5 秒重扫目录），加完立刻生效、不用重启；「设置」则要连
+> `config.json` 一起共享，**并自己重启上游**（上游只在启动时读一次配置）。
+> 两个方案的挂法与坑（其中一个挂法会让容器起不来）都写在
+> [`deploy/k8s/README.md`](deploy/k8s/README.md)。
 
 几处刻意的设计（理由都写在清单注释里）：
 

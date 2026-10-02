@@ -169,22 +169,54 @@ kubectl -n workbuddy rollout restart deploy/workbuddy2api deploy/workbuddy-manag
 - **NFS / 云盘 CSI**：**更省事的做法是把四个 PV 全删掉**，给四个 PVC 填上
   `storageClassName`（并删掉 `storageClassName: ""`），走动态供给。
 
-## 有 RWX 存储时切回「共享卷」（找回加账号 / 改设置）
+## 有 RWX 存储时切回「共享卷」（找回面板的能力）
 
-有 ReadWriteMany（NFS / CephFS / Longhorn 等）时，可以让面板与上游共用一块卷，
-面板的「添加账号」与「设置保存」就都能用了。改三处：
+有 ReadWriteMany（NFS / CephFS / Longhorn 等）时可以让面板与上游共用一块卷。
+但**账号和配置的「同步语义」完全不同**，所以推荐只共享 `auths/`：
 
-1. **建一块 RWX 卷**（静态 PV 或动态供给都行），例如 `workbuddy2api-shared`，
-   里面放 `config.json` 与 `auths/` 两项。
-2. **上游**（`10-upstream.yaml`）：把 `config` 与 `auths` 两个卷换成这一块，
-   挂载写成 `mountPath: /app/auths` + `subPath: auths`、`mountPath: /app/config.json`
-   + `subPath: config.json`；init 容器改挂到 `/cfg` 并加一句 `mkdir -p /cfg/auths`。
-3. **面板**（`20-manager.yaml`）：加上这块卷并挂到 `/opt/workbuddy2api`
-   （镜像里 `WB_AUTH_DIR` / `WB_UPSTREAM_CONFIG` 的默认值正好指向这里，不用设环境变量）。
+### 方案 A（推荐）：只共享 `auths/` —— 加完立刻生效，不用重启
 
-> 用 RWO 卷做共享时，两个 Pod 必须落在**同一节点**：给面板补一段
-> `podAffinity`（`topologyKey: kubernetes.io/hostname`，匹配
-> `app.kubernetes.io/name: workbuddy2api`）。用 RWX 就不需要这段亲和。
+上游对 `auths/` 是**热加载**的（`internal/pool/watch.go` 每 5 秒重扫该目录），
+面板扫码写进去的凭证会自动进池；而 `config.json` 仍然不给面板，于是
+「配置同步」这个问题根本不存在。
+
+1. 建一块 RWX 卷（静态 PV 或动态供给），只放 `auths/`。
+2. **上游**：把 `auths` 那个卷换成它（`mountPath: /app/auths`），`config` 卷不动。
+3. **面板**：把它挂到一个**独立路径**（例如 `/upstream-auths`），并加一个环境变量
+   `WB_AUTH_DIR=/upstream-auths`；`/opt/workbuddy2api` 上的只读空卷**保持不变**。
+
+> ⚠️ **别**把共享卷挂成 `/opt/workbuddy2api/auths`。容器运行时先挂只读的父目录，
+> 再试图在它里面创建子挂载点，结果是**容器直接起不来**（实测报
+> `mkdirat .../opt/workbuddy2api/auths: read-only file system`）。
+> 两个挂载点必须互不嵌套 —— 用 `WB_AUTH_DIR` 把面板指过去即可（已实测：面板按该
+> 变量走，写进去的文件确实落到共享卷上，而 `/opt/workbuddy2api` 下的写入仍被挡住）。
+
+### 方案 B：连 `config.json` 也共享 —— 能拿回设置页，但有个坑
+
+在方案 A 之上再做一步，把 `config.json` 也放进共享卷：
+
+- **上游**：`config` 卷换成它，挂载写成 `mountPath: /app/config.json`
+  + `subPath: config.json`（init 容器改挂到 `/cfg` 去生成这个文件）；
+- **面板**：把这块卷挂到另一个独立路径（例如 `/upstream-config`），并设
+  `WB_UPSTREAM_CONFIG=/upstream-config/config.json`。
+
+**代价：每次保存设置后必须自己重启上游**：
+
+```bash
+kubectl -n workbuddy rollout restart deploy/workbuddy2api
+```
+
+**上游只在启动时读一次配置** —— 源码 `cmd/server/main.go` 里只有一次 `Load`，
+没有 fsnotify、没有 SIGHUP 重载、没有定时重读。Docker 部署里「保存即生效」是面板调
+docker 把上游容器**重启**了，k8s 里没有这个能力。忘重启的症状是
+**「设置页显示已保存、上游行为没变」**，很难查。
+
+> `api_key` 由上游的 init 容器每次启动用 Secret 的值重写，面板用的是 `WB2API_KEY`
+> （同一个 Secret），所以两边始终一致 —— 代价是**换密钥只能改 Secret**。
+>
+> 用 RWO 卷做共享时，两个 Pod 必须落在**同一节点**：给面板补一段 `podAffinity`
+> （`topologyKey: kubernetes.io/hostname`，匹配 `app.kubernetes.io/name: workbuddy2api`）。
+> 用 RWX 就不需要这段亲和。
 
 ## 常见坑
 
@@ -192,7 +224,8 @@ kubectl -n workbuddy rollout restart deploy/workbuddy2api deploy/workbuddy-manag
 |---|---|
 | PV 一直 `Pending` / PVC 绑不上 | `claimRef.namespace` 写错（换过命名空间？），或 PV 与 PVC 的 `storageClassName` 不一致 —— 静态供给时两边必须**同时**为空字符串或同时填同一个名字 |
 | 上游或面板 Pod `CreateContainerConfigError` | 少了 Secret：`workbuddy2api-secret` 必建（两个组件都要它） |
-| 面板报「读不到上游配置」/ 加账号报错 | 预期行为，见「两个组件的边界」；要用这两项就切回共享卷 |
+| 面板报「读不到上游配置」/ 加账号写进了没人读的目录 | 预期行为，见「两个组件的边界」；要拿回这两项见下面「有 RWX 存储时切回共享卷」 |
+| 共享卷模式下「设置页显示已保存，但上游行为没变」 | 忘了重启上游 —— 配置只在启动时读一次（见该小节的方案 B） |
 | 账号数是 0，但 `auths/` 里明明有文件 | 卷属主不对（`fsGroup` 在 hostPath 这类卷上可能不生效）：上节点 `chown -R 10001:10001 /srv/workbuddy/upstream/auths` |
 | 改了 `config.json` 没生效 | 上游要重启（见「改上游配置」） |
 | 改完 `config.json` 又变回去了 | 那是 `api_key` 字段：它每次启动都由 init 容器从 Secret 重写，属正常 |
