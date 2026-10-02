@@ -14,9 +14,7 @@
 #   · 「扫码添加账号」回来了：面板的 WB_AUTH_DIR 默认就是 /opt/workbuddy2api/auths，
 #     和上游的 /app/auths 是同一块卷 —— 面板写进去，上游每 5 秒扫一次自动进池；
 #   · 「设置」页保存回来了：面板与上游读写的是**同一个 config.json**（同一个 inode）。
-#     ⚠️ 但**保存后必须重启上游才生效**（上游只在启动时读一次配置，没有热重载）：
-#        kubectl -n workbuddy rollout restart deploy/workbuddy
-#     同 Pod 下这条命令会把面板也重启（几秒）—— 这是同 Pod 的代价之一。
+#     改完由上游容器里的 supervisor **自动生效**（2~5 秒）—— 见下面 workbuddy2api 容器的 command/args。
 #
 # 代价（这些若对你更重要，就该拆回两个 Deployment，本目录历史版本就是这么做的）：
 #   · **Pod Ready 是聚合的**：Service 的 endpoint 以 Pod 为单位 —— 上游容器崩了，整个
@@ -63,8 +61,8 @@
 #   3. 配置有**唯一真源**：配置卷上的 config.json。清单里**没有** ConfigMap 那一层
 #      —— 那种「改了却对运行中的部署没用」的影子副本最容易骗人。所以：
 #        面板「设置」页保存 或 直接改宿主机上的那个文件 → **永久生效**，重启不丢；
-#        但上游只在启动时读一次配置，改完要重启才生效：
-#          kubectl -n workbuddy rollout restart deploy/workbuddy
+#        改完由上游容器里的 supervisor **自动重启上游进程**（2~5 秒生效），不用手动做什么；
+#        想手动重启也可以：kubectl -n workbuddy rollout restart deploy/workbuddy
 #   4. 面板的另一个「看着像成功其实没用」的坑已经没有了：auths/ 现在是真的共享目录，
 #      写进去上游读得到（旧版本给 /opt/workbuddy2api 挂只读空卷正是为了挡住它）。
 #   5. 上游的「重启上游 / 读上游日志 / 一键更新」这几个面板功能在 K8s 下会降级报错
@@ -350,6 +348,68 @@ spec:
           imagePullPolicy: Always
           # 要可复现（不被下一次上游重建影响）就钉内容寻址标签：
           #   image: ghcr.io/smagicalk/workbuddy2api:sha256-6d3582fcedbb
+          # ── 让「保存即生效」在 K8s 里真的成立 ────────────────────────────
+          # 上游只在**进程启动时**读一次 config.json（没有热重载）。面板「设置」页保存后
+          # 会调 docker 重启上游容器 —— K8s 里没有 docker，那一步必然失败，于是「保存了
+          # 却不生效」。这段极小的 supervisor 盯住 config.json 的**内容哈希**，一变就优雅
+          # 重启上游进程：SIGTERM → 上游落盘 state 并等在途请求结束（其 main.go 的优雅停机），
+          # 所以不会掐断正在进行的对话，面板与整个 Pod 也不受影响。
+          # 顺带：进程意外退出（例如配置语义非法）会被重新拉起，跑得太短则 3 秒退避，不刷屏。
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              CONFIG=/app/config.json
+              CHILD=''
+              INTERVAL=2
+
+              # 容器停止时 kubelet 只给 PID 1（本 shell）发信号，必须由我们转发给子进程，
+              # 否则上游来不及优雅停机（state 可能落不了盘）。
+              forward_term() {
+                if [ -n "$CHILD" ] && kill -0 "$CHILD" 2>/dev/null; then
+                  echo "[supervisor] 转发 SIGTERM 给上游进程 $CHILD（它会落盘并等在途请求）"
+                  kill -TERM "$CHILD" 2>/dev/null || true
+                  wait "$CHILD" 2>/dev/null || true
+                fi
+              }
+              on_signal() {
+                echo "[supervisor] 收到停止信号，退出"
+                forward_term
+                exit 0
+              }
+              trap on_signal TERM INT
+
+              # 内容哈希：文件不存在、或**还不是合法 JSON**（面板写文件是先截断再写）时输出空，
+              # 于是不会因为读到半个文件而白白重启一次。
+              config_hash() {
+                [ -f "$CONFIG" ] || return 0
+                python3 -c 'import json,sys;json.load(open(sys.argv[1]))' "$CONFIG" >/dev/null 2>&1 || return 0
+                sha256sum "$CONFIG" | cut -d' ' -f1
+              }
+
+              while :; do
+                /app/wb2api -config "$CONFIG" &
+                CHILD=$!
+                last="$(config_hash)"
+                started=$(date +%s)
+                while kill -0 "$CHILD" 2>/dev/null; do
+                  sleep "$INTERVAL"
+                  now="$(config_hash)"
+                  if [ -n "$now" ] && [ "$now" != "$last" ]; then
+                    echo "[supervisor] config.json 内容已变，优雅重启上游进程"
+                    last="$now"
+                    forward_term
+                    break
+                  fi
+                done
+                wait "$CHILD" 2>/dev/null || true
+                CHILD=''
+                ran=$(( $(date +%s) - started ))
+                if [ "$ran" -lt 5 ]; then
+                  echo "[supervisor] 上游进程只存活 ${ran}s 就退出，3 秒后重试"
+                  sleep 3
+                fi
+              done
           env:
             # 定时任务里「几点执行」按进程本地时区判定（上游 nowFunc = time.Now），
             # 固定 CST 让 config.json 里的 9 / 21 点就是北京时间。
@@ -398,8 +458,8 @@ spec:
               drop: ["ALL"]
           volumeMounts:
             # 配置：单文件挂载，来自下面的 config PVC（**面板也挂它**）。
-            # 上游自己不写它，写它的是面板；上游只在启动时读一次 →
-            # 面板保存之后要重启上游才生效。
+            # 上游自己不写它，写它的是面板；上游只在启动时读一次配置 ——
+            # 但容器里的 supervisor 盯住**这个文件的内容**，一变就优雅重启上游进程（2~5 秒生效）。
             - name: config
               mountPath: /app/config.json
               subPath: config.json
@@ -493,8 +553,8 @@ spec:
             # /app/data（另外 /app/.version 是自愈标记，官方 Docker 部署同样落在容器层），
             # 所以这两条子路径在文件层面是完备的 —— 逐条对照见 deploy/k8s/README.md。
             # 与上游**共享**的配置文件，读写挂载：「设置」页保存要真的落盘。
-            # 与上游 /app/config.json 是同一个 inode（不是拷贝），但上游只在启动时读
-            # 一次配置 —— 保存成功后要重启上游才生效。
+            # 与上游 /app/config.json 是同一个 inode（不是拷贝）。
+            # 保存后由**上游容器里的 supervisor** 在 2~5 秒内优雅重启上游进程，无需手动操作。
             - name: config
               mountPath: /opt/workbuddy2api/config.json
               subPath: config.json

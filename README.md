@@ -276,14 +276,12 @@ kubectl -n workbuddy port-forward svc/workbuddy-manager 7864:7864
 `config.json` 里没有任何密钥：`api_key` 由 Secret 经 `WB2A_API_KEY`（上游）与
 `WB2API_KEY`（面板）注入，文件里留空即可。
 
-**仍然存在的限制**：上游**只在启动时读一次配置**（源码 `cmd/server/main.go` 里只有一次
-`Load`，没有 fsnotify、没有 SIGHUP），所以面板「设置」页保存成功后要自己重启一次才生效：
+**配置改动「保存即生效」**：上游只在**进程启动时**读一次配置（源码 `cmd/server/main.go` 里只有
+一次 `Load`，没有 fsnotify、没有 SIGHUP），所以清单给上游容器套了一个几十行的 supervisor
+（就是那个容器的 `command/args`，**不碰上游代码**）：它盯住 `config.json` 的内容哈希，一变就
+优雅重启上游进程（SIGTERM → 上游落盘 state 并等在途请求结束）。本地实跑验证：保存后
+**2~5 秒**生效，面板与整个 Pod 都不受影响。
 
-```bash
-kubectl -n workbuddy rollout restart deploy/workbuddy
-```
-
-忘重启的症状是**「设置页显示已保存、上游行为没变」**，很难查。
 **加账号不用重启**：上游每 5 秒重扫 `auths/`（`internal/pool/watch.go`），面板扫码写进去就进池。
 细节与全部坑位见 [`deploy/k8s/README.md`](deploy/k8s/README.md)。
 
@@ -294,6 +292,7 @@ kubectl -n workbuddy rollout restart deploy/workbuddy
 | 上游副本数 | **固定 `replicas: 1`** + `strategy: Recreate` | 账号池是单进程本地状态：多副本会各自跑一遍定时任务并争抢同一份 `state.json` |
 | 两个容器 | 同一个 Pod | 共享 RWO 卷不需要 `podAffinity`（同一个 Pod 不可能跨节点）；面板可直接连 `127.0.0.1:7863` |
 | 同 Pod 的代价 | Pod Ready 聚合、镜像拉取是单点、只能整 Pod 重启 | 上游容器崩了，面板的 Service 也会失去 endpoint —— 更看重「面板独立可用」就按 README 里的「拆成两套部署」拆开 |
+| 配置生效 | 上游容器里跑一个 supervisor（清单里的 `command/args`），盯 `config.json` 的内容哈希，一变就优雅重启上游进程 | 「保存即生效」（2~5 秒），不必重启 Pod、面板不中断；上游的优雅停机保证不掐断在途请求 |
 | 卷属主 | `fsGroup: 10001` | 等价于 Docker 那步 `chown -R 10001:10001`，不用手工改 |
 | hostPath 与多节点 | 四个 PV 都要加 `nodeAffinity` 钉到**同一台**节点，或改用 CSI 存储 | 不钉的话 Pod 落到别的节点会看到空目录：账号池变 0、配置回默认基线 —— 很像数据丢了（数据其实在另一台上） |
 | 上游探针 | **TCP 探针**，不用 `/healthz` | `/healthz` 空池返回 503：当 liveness 会反复重启，当 readiness 会让加账号都做不了 |
