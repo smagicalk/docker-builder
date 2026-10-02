@@ -8,7 +8,7 @@ HTTP 连过去 —— 所以两边互不等待，各自调度、各自升级重�
 
 | 组件 | 镜像 | 端口 | 存储 |
 |---|---|---|---|
-| 上游网关 | `ghcr.io/smagicalk/workbuddy2api:latest`（**本仓库自动构建**） | 7863 | 配置 / 凭证 / 池状态，3 块卷，上游独享 |
+| 上游网关 | `ghcr.io/smagicalk/workbuddy2api:latest`（**本仓库自动构建**） | 7863 | 凭证 / 池状态（2 块卷，上游独享）；配置走只读 ConfigMap |
 | 管理面板（入口） | `ghcr.io/ithtelab/workbuddy-manager:latest`（官方发布） | 7864 | 面板数据，1 块卷，面板独享 |
 
 上游原仓库已不可访问，源码随 workbuddy-manager 的 Release 附件分发，
@@ -19,7 +19,7 @@ HTTP 连过去 —— 所以两边互不等待，各自调度、各自升级重�
 | 文件 | 内容 |
 |---|---|
 | `00-namespace.yaml` | 命名空间 `workbuddy`（PV 的 `claimRef` 依赖它） |
-| `10-upstream.yaml` | 上游：3 PV + 3 PVC + ConfigMap + Deployment + Service |
+| `10-upstream.yaml` | 上游：2 PV + 2 PVC + ConfigMap（配置本体）+ Deployment + Service |
 | `20-manager.yaml` | 面板：1 PV + 1 PVC + Deployment + Service +（注释掉的）Ingress |
 
 ```bash
@@ -28,26 +28,27 @@ kubectl apply -f deploy/k8s/      # 按文件名顺序应用
 
 ## 存储对应表
 
-四块 PV 都是 `hostPath` + `Retain`（删 PVC 不删数据），路径固定，一眼对得上：
+**配置**（`config.json`）不占卷 —— 它是只读的 ConfigMap `workbuddy2api-config`；
+其余三块 PV 都是 `hostPath` + `Retain`（删 PVC 不删数据），路径固定，一眼对得上：
 
 | PV / PVC | 存储（宿主机路径） | 挂载点 | 里面是什么 | 丢了会怎样 |
 |---|---|---|---|---|
-| `workbuddy2api-config`（1Gi） | `/srv/workbuddy/upstream/config` | 上游 `/app/config.json`（subPath 单文件） | `config.json`：定时任务 / 限流 / 并发 / 提示词等全部配置 | 回落到模板（`api_key` 由 init 容器重新填入），改过的设置会丢 |
-| `workbuddy2api-auths`（1Gi） | `/srv/workbuddy/upstream/auths` | 上游 `/app/auths` | 每个账号一份凭证 `workbuddy-<uid>.json` | **要重新扫码加号** —— 四块里最该备份的 |
+| `workbuddy2api-auths`（1Gi） | `/srv/workbuddy/upstream/auths` | 上游 `/app/auths` | 每个账号一份凭证 `workbuddy-<uid>.json` | **要重新扫码加号** —— 最该备份的一个 |
 | `workbuddy2api-pool`（1Gi） | `/srv/workbuddy/upstream/pool` | 上游 `/app/data` | `state.json`（积分/冷却/熔断）、`model.json`（成本账本） | 不致命，冷却与便宜号账本要重新学 |
 | `workbuddy-manager-data`（5Gi） | `/srv/workbuddy/manager/data` | 面板 `/app/data` | `manager.db`（密钥/日志/用量/审计）、`users.json`（管理员 + 会话签名密钥） | 要重新初始化管理员、已发会话全部失效、统计与审计丢失 |
 
-每块卷都是**独享**的：面板不挂上游那三块，上游也不挂面板那块。
+每块卷都是**独享**的：面板不挂上游那两块，上游也不挂面板那块。
 
 ## 两个组件的边界（为什么加账号要在上游做）
 
 上游既没有「加账号」的 HTTP 接口，也没有热改配置的接口 —— 面板那两项功能天生
-要靠**直接读写上游的 `auths/` 与 `config.json`**。所以拆开之后：
+要靠**直接读写上游的 `auths/` 与 `config.json`**（清单里后者是只读的 ConfigMap，
+所以那一项在 K8s 下改用 kubectl 改 ConfigMap，见下节）。所以拆开之后：
 
 | 面板功能 | 拆开部署后 | 替代做法 |
 |---|---|---|
 | 扫码「添加账号」 | ✗ **看似成功**：会写进面板容器自己的目录，上游读不到（显示「未加载」）、Pod 重启即丢 —— 清单里已用**只读空卷**把它变成硬报错 | 在上游容器里登录（见下节） |
-| 「设置」页保存 | ✗ 读不到 `config.json` → 报错并锁定保存（写入同样被只读卷挡住） | 改 `config.json` + 重启上游（见下节） |
+| 「设置」页保存 | ✗ 读不到 `config.json` → 报错并锁定保存 | 改 ConfigMap + 重启上游（见下节） |
 | 上游重启 / 读上游日志 / 端口收敛 / 一键更新 | ✗ 降级提示（k8s 里没有 docker 守护进程） | `kubectl -n workbuddy logs\|rollout restart ...` |
 | 仪表盘、账号列表、密钥分发、请求日志、用量统计、IP 管控、模型中心、聊天测试台 | ✓ 照常（`pool_available` 会如实反映连不连得上上游） | 只走 HTTP，不受影响 |
 
@@ -69,7 +70,7 @@ kubectl apply -f deploy/k8s/      # 按文件名顺序应用
 kubectl apply -f deploy/k8s/00-namespace.yaml
 
 # 2) 建两个密钥。**密钥不在清单里**：放进去会被 apply 用占位值覆盖回去
-#    api_key：上游的 init 容器与面板的 WB2API_KEY 都读它，必建
+#    api_key：上游的 WB2A_API_KEY 与面板的 WB2API_KEY 都读它，必建
 kubectl -n workbuddy create secret generic workbuddy2api-secret \
   --from-literal=api_key="$(openssl rand -hex 32)" \
   --dry-run=client -o yaml | kubectl apply -f -
@@ -101,26 +102,24 @@ kubectl -n workbuddy exec -it deploy/workbuddy2api -- ./login.sh --realm=cn
 
 ### 改上游配置
 
-`/app/config.json` 是 subPath 单文件挂载、可写，改动会直接落到配置卷上。
-上游镜像里**没有 `vi`**（只有 `python3`），所以：
+配置来自 **ConfigMap `workbuddy2api-config`**（只读挂载），改它就是改这个对象：
 
 ```bash
-# ① 拽到本机改好再塞回去（顺手；容器里有 tar）
-POD=$(kubectl -n workbuddy get pod -l app.kubernetes.io/name=workbuddy2api \
-        -o jsonpath='{.items[0].metadata.name}')
-kubectl -n workbuddy cp "$POD:/app/config.json" ./config.json
-#    ……用你习惯的编辑器改 ./config.json……
-kubectl -n workbuddy cp ./config.json "$POD:/app/config.json"
-kubectl -n workbuddy rollout restart deploy/workbuddy2api
+# ① 在线编辑（存盘即更新对象）
+kubectl -n workbuddy edit configmap workbuddy2api-config
 
-# ② 或者就地用 python 改一个字段
-kubectl -n workbuddy exec -it deploy/workbuddy2api -- python3 -c \
-  "import json;p='/app/config.json';c=json.load(open(p));c['schedule']['checkin_hours']=[8,20];json.dump(c,open(p,'w'),ensure_ascii=False,indent=2)"
+# ② 或者改一份 YAML 再 apply（适合放进 Git 管理）
+kubectl apply -f my-configmap.yaml
+
+# 改完必须重启上游：上游只在启动时读一次配置
 kubectl -n workbuddy rollout restart deploy/workbuddy2api
 ```
 
-上游**只在启动时读 `config.json`**，改完必须重启才生效。
-`api_key` 别在这里改（每次启动都会被 init 容器用 Secret 的值覆盖，见下节）。
+两点注意：
+
+- 挂载走 `subPath`（单文件），**ConfigMap 更新不会自动进容器** —— 反正都要重启；
+- **`api_key` 别在这里改**：它恒被 `WB2A_API_KEY` 覆盖（真源是 Secret），
+  文件里留空即可；换密钥见下节。
 
 ### 验证
 
@@ -150,8 +149,8 @@ kubectl -n workbuddy rollout restart deploy/workbuddy-manager
 
 ### 换掉 api_key
 
-改 Secret，然后重启**两个** Deployment（上游的 init 容器会把新值写进
-`config.json`，面板从同一个 Secret 读 `WB2API_KEY`）：
+改 Secret，然后重启**两个** Deployment（上游用 `WB2A_API_KEY` 读它，面板用
+`WB2API_KEY` 读它 —— 都来自同一个 Secret）：
 
 ```bash
 kubectl -n workbuddy create secret generic workbuddy2api-secret \
@@ -191,13 +190,15 @@ kubectl -n workbuddy rollout restart deploy/workbuddy2api deploy/workbuddy-manag
 > 两个挂载点必须互不嵌套 —— 用 `WB_AUTH_DIR` 把面板指过去即可（已实测：面板按该
 > 变量走，写进去的文件确实落到共享卷上，而 `/opt/workbuddy2api` 下的写入仍被挡住）。
 
-### 方案 B：连 `config.json` 也共享 —— 能拿回设置页，但有个坑
+### 方案 B：把 `config.json` 换回可写卷 —— 能拿回设置页，但有个坑
 
-在方案 A 之上再做一步，把 `config.json` 也放进共享卷：
+方案 A 里 `config.json` 是只读的 ConfigMap，面板写不进去。想让「设置」页能保存，
+就得把它从 ConfigMap 换回**一块可写卷**（一个 PV/PVC，像 `auths` 那样）：
 
-- **上游**：`config` 卷换成它，挂载写成 `mountPath: /app/config.json`
-  + `subPath: config.json`（init 容器改挂到 `/cfg` 去生成这个文件）；
-- **面板**：把这块卷挂到另一个独立路径（例如 `/upstream-config`），并设
+- **上游**：`config` 卷从 `configMap:` 换回 `persistentVolumeClaim:`，挂载仍是
+  `mountPath: /app/config.json` + `subPath: config.json`；因为文件必须存在，还得把
+  之前删掉的 init 容器（从 ConfigMap 种一份初值）再放回来；
+- **面板**：把这块卷挂到独立路径（例如 `/upstream-config`），并设
   `WB_UPSTREAM_CONFIG=/upstream-config/config.json`。
 
 **代价：每次保存设置后必须自己重启上游**：
@@ -211,8 +212,8 @@ kubectl -n workbuddy rollout restart deploy/workbuddy2api
 docker 把上游容器**重启**了，k8s 里没有这个能力。忘重启的症状是
 **「设置页显示已保存、上游行为没变」**，很难查。
 
-> `api_key` 由上游的 init 容器每次启动用 Secret 的值重写，面板用的是 `WB2API_KEY`
-> （同一个 Secret），所以两边始终一致 —— 代价是**换密钥只能改 Secret**。
+> `api_key` 由 Secret 经 `WB2A_API_KEY` 环境变量注入（**不落文件**），面板用的是
+> `WB2API_KEY`（同一个 Secret）—— 两边始终一致，代价是**换密钥只能改 Secret**。
 >
 > 用 RWO 卷做共享时，两个 Pod 必须落在**同一节点**：给面板补一段 `podAffinity`
 > （`topologyKey: kubernetes.io/hostname`，匹配 `app.kubernetes.io/name: workbuddy2api`）。
@@ -227,7 +228,7 @@ docker 把上游容器**重启**了，k8s 里没有这个能力。忘重启的�
 | 面板报「读不到上游配置」/ 加账号写进了没人读的目录 | 预期行为，见「两个组件的边界」；要拿回这两项见下面「有 RWX 存储时切回共享卷」 |
 | 共享卷模式下「设置页显示已保存，但上游行为没变」 | 忘了重启上游 —— 配置只在启动时读一次（见该小节的方案 B） |
 | 账号数是 0，但 `auths/` 里明明有文件 | 卷属主不对（`fsGroup` 在 hostPath 这类卷上可能不生效）：上节点 `chown -R 10001:10001 /srv/workbuddy/upstream/auths` |
-| 改了 `config.json` 没生效 | 上游要重启（见「改上游配置」） |
-| 改完 `config.json` 又变回去了 | 那是 `api_key` 字段：它每次启动都由 init 容器从 Secret 重写，属正常 |
+| 改了配置没生效 | 上游只在启动时读一次配置：改完 ConfigMap 要 `kubectl -n workbuddy rollout restart deploy/workbuddy2api` |
+| 在 ConfigMap 里改 `api_key` 不生效 | 密钥由 Secret 经 `WB2A_API_KEY` 环境变量注入，**文件里的 api_key 恒被忽略**；换密钥只能改 Secret |
 | 想扩上游副本 | **别扩**。账号池是单实例本地状态，多副本会重复跑定时任务并争抢 `state.json`；真要扩容先关掉 `config.json` 里的 `schedule.*` |
 | 面板显示「上游不可用」 | `kubectl -n workbuddy exec deploy/workbuddy-manager -- curl -s http://workbuddy2api:7863/healthz`。注意 503 = 上游在跑但没有可用账号，不是连不上 |

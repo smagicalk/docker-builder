@@ -13,20 +13,18 @@
 #     读写这里的 auths/ 与 config.json（上游没有对应的 HTTP 接口）。
 #     替代做法写在 deploy/k8s/README.md；有 RWX 存储的话也能切回共享卷模式。
 #
-# ── 存储对应表（三个卷，全部由上游独享）──────────────────────────
-#   PV workbuddy2api-config   hostPath /srv/workbuddy/upstream/config  1Gi
-#      → 挂上游 /app/config.json（subPath 单文件）
-#      里面放：config.json（定时任务 / 限流 / 并发 / 提示词等全部配置）
-#      丢了会怎样：回落到 ConfigMap 模板（api_key 由 init 容器重新填入），
-#                  面板改过的设置会丢 —— 所以值得备份。
+# ── 存储对应表（两个卷，全部由上游独享）──────────────────────────
 #   PV workbuddy2api-auths    hostPath /srv/workbuddy/upstream/auths   1Gi
 #      → 挂上游 /app/auths
 #      里面放：auths/workbuddy-<uid>.json（每个账号一份凭证）
-#      丢了会怎样：**要重新扫码加号**。这是三个卷里最该备份的。
+#      丢了会怎样：**要重新扫码加号**。这是最该备份的一个。
 #   PV workbuddy2api-pool     hostPath /srv/workbuddy/upstream/pool    1Gi
 #      → 挂上游 /app/data
 #      里面放：state.json（积分 / 冷却 / 熔断计数）、model.json（成本账本）
 #      丢了会怎样：不致命，但冷却状态与便宜号账本要重新学。
+#
+# 配置（config.json）**不在卷上** —— 它是下面那个 ConfigMap，只读挂载；
+# 密钥由 Secret 经 WB2A_API_KEY 注入。改配置见文件开头第 3 条。
 #
 # hostPath 最省事、最透明，代价是**数据绑在节点上**（Pod 只能调度到有数据的那台）。
 # 多节点集群换成 NFS / 云盘 CSI —— 那是动态供给，把本文件的 PV 全删掉、
@@ -40,48 +38,10 @@
 #   2. 探针刻意用 TCP，不用 /healthz：/healthz 在账号池为空时返回 503（应用层语义，
 #      见上游 handler.go 的 Pool.ServableNow()）。当 liveness 会让 Pod 反复重启，
 #      当 readiness 会让「还没加账号」时 Service 不转发、连登录加号都做不了。
-#   3. 上游**只在启动时读 config.json**，没有热重载。改完配置要
-#      `kubectl -n workbuddy rollout restart deploy/workbuddy2api`。
-
----
-# 配置卷：只装 config.json（subPath 挂成单文件）。
-apiVersion: v1
-kind: PersistentVolume
-metadata:
-  name: workbuddy2api-config
-  labels:
-    app.kubernetes.io/part-of: workbuddy
-spec:
-  capacity:
-    storage: 1Gi
-  accessModes: ["ReadWriteOnce"]
-  persistentVolumeReclaimPolicy: Retain
-  # 空字符串 = 静态供给（不走 StorageClass 动态创建）。必须与 PVC 一致。
-  storageClassName: ""
-  volumeMode: Filesystem
-  hostPath:
-    path: /srv/workbuddy/upstream/config
-    type: DirectoryOrCreate
-  # 钉住目标 PVC：静态供给时若不加 claimRef，别的 PVC 可能先把这块 PV 抢走。
-  # 换命名空间时这里要跟着改（或删掉这三行）。
-  claimRef:
-    namespace: workbuddy
-    name: workbuddy2api-config
-  # ── 多节点集群：把 hostPath 换成下面任一种 ──────────────────────
-  # (a) 本地盘 + 节点亲和（数据仍绑节点，但调度不会跑到没有盘的那台）
-  #     local:
-  #       path: /srv/workbuddy/upstream/config
-  #     nodeAffinity:
-  #       required:
-  #         nodeSelectorTerms:
-  #           - matchExpressions:
-  #               - key: kubernetes.io/hostname
-  #                 operator: In
-  #                 values: ["node-1"]
-  # (b) NFS（三个卷都可以这样换）
-  #     nfs:
-  #       server: 10.0.0.10
-  #       path: /export/workbuddy/upstream/config
+#   3. 配置来自 **ConfigMap**（只读挂载），上游**只在启动时读一次**、没有热重载：
+#      改配置走 `kubectl -n workbuddy edit configmap workbuddy2api-config`，
+#      然后 `kubectl -n workbuddy rollout restart deploy/workbuddy2api`。
+#      换密钥更简单：改 Secret 后重启（文件里的 api_key 恒为空，由环境变量注入）。
 
 ---
 # 账号凭证卷：**最该备份的一个**。
@@ -131,20 +91,6 @@ spec:
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: workbuddy2api-config
-  namespace: workbuddy
-spec:
-  # 与 PV 一致，都为空 = 静态供给
-  storageClassName: ""
-  accessModes: ["ReadWriteOnce"]
-  resources:
-    requests:
-      storage: 1Gi
-
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
   name: workbuddy2api-auths
   namespace: workbuddy
 spec:
@@ -170,7 +116,7 @@ spec:
 ---
 # ⚠️ 这个 Secret **故意不放在清单里** —— 请先手动建它，再 apply 本文件。
 #    两个用途都要它：
-#      · 上游的 init 容器读它，把 api_key 写进 config.json（login.sh 等脚本要读文件）
+#      · 上游的 WB2A_API_KEY 环境变量（ConfigMap 里的 api_key 恒为空）
 #      · 面板读它当 WB2API_KEY（面板与上游之间的鉴权）
 #    缺了它两边的 Pod 都起不来（会明确报错，不会静默降级）。
 #
@@ -193,13 +139,18 @@ spec:
 #   api_key: "换成你自己的随机值（openssl rand -hex 32）"
 
 ---
-# config.json 的初始模板：只在配置卷上还没有 config.json 时用一次。
-# api_key 留空，由 init 容器从上面的 Secret 填入。
-# 这里给的是上游默认基线；缺的字段会走上游内置默认值（含那套默认定时任务）。
+# 上游的配置本体：**只读**挂成 /app/config.json。
+#   · api_key 故意留空 —— 真值由 Deployment 里的 WB2A_API_KEY（来自 Secret）注入，
+#     所以这个 ConfigMap 里没有任何密钥，可以安全地进版本库。
+#   · 改配置 = 改这里 + 重启上游（上游只在启动时读一次，没有热重载）：
+#       kubectl -n workbuddy edit configmap workbuddy2api-config
+#       kubectl -n workbuddy rollout restart deploy/workbuddy2api
+#   · 挂载走 subPath（单文件），ConfigMap 更新**不会**自动进容器 —— 反正都要重启。
+# 缺的字段会走上游内置默认值（含那套默认定时任务）。
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: workbuddy2api-config-template
+  name: workbuddy2api-config
   namespace: workbuddy
 data:
   config.json: |
@@ -310,37 +261,6 @@ spec:
         runAsUser: 10001
         runAsGroup: 10001
         fsGroup: 10001
-      initContainers:
-        - name: prepare-config
-          image: ghcr.io/smagicalk/workbuddy2api:latest
-          imagePullPolicy: Always
-          command: ["/bin/sh", "-c"]
-          args:
-            - |
-              set -eu
-              # 首次启动：用 ConfigMap 模板生成 config.json。
-              # 主容器是拿 subPath 把**这一个文件**挂到 /app/config.json 的，
-              # 文件不存在会直接挂载失败，所以必须由这里先把它造出来。
-              if [ ! -f /cfg/config.json ]; then
-                echo "[init] 配置卷上还没有 config.json，从模板生成"
-                cp /template/config.json /cfg/config.json
-              fi
-              # 把 api_key 同步成 Secret 里的值。只在这一处写文件，避免
-              # 「Secret 与文件各说一套」；上游的 login.sh 等脚本都读这个文件。
-              python3 -c "import json,os;p='/cfg/config.json';c=json.load(open(p));c['api_key']=os.environ['API_KEY'];json.dump(c,open(p,'w'),ensure_ascii=False,indent=2);print('[init] api_key 已同步自 Secret')"
-              echo "[init] 配置卷就绪"
-          env:
-            - name: API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: workbuddy2api-secret
-                  key: api_key
-          volumeMounts:
-            - name: config
-              mountPath: /cfg
-            - name: template
-              mountPath: /template
-              readOnly: true
       containers:
         - name: workbuddy2api
           image: ghcr.io/smagicalk/workbuddy2api:latest
@@ -354,6 +274,14 @@ spec:
             # 固定 CST 让 config.json 里的 9 / 21 点就是北京时间。
             - name: TZ
               value: Asia/Shanghai
+            # 密钥：ConfigMap 里的 api_key 故意留空，由这个环境变量注入。
+            # 上游支持 WB2A_* 覆盖配置，且覆盖发生在校验之前（cmd/server/config.go），
+            # 所以文件里留空也没问题 —— 密钥只存在于 Secret 一处。
+            - name: WB2A_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: workbuddy2api-secret
+                  key: api_key
           ports:
             - name: http
               containerPort: 7863
@@ -385,12 +313,12 @@ spec:
             capabilities:
               drop: ["ALL"]
           volumeMounts:
-            # 配置：挂成单文件。上游自己不写它，但**故意不给 readOnly** ——
-            # 拆开部署后没有共享卷，改配置要靠 kubectl cp / exec 直接写这个文件，
-            # 而 subPath 单文件挂载本身是可写的（写进去就落到配置卷上）。
+            # 配置：ConfigMap 只读挂成单文件。上游从不写它，只读正合适；
+            # 改配置 = 改 ConfigMap + 重启上游（见文件开头第 3 条）。
             - name: config
               mountPath: /app/config.json
               subPath: config.json
+              readOnly: true
             # 账号凭证：扫码落盘、令牌刷新都是 tmp+rename 回写，必须可写。
             - name: auths
               mountPath: /app/auths
@@ -398,17 +326,14 @@ spec:
               mountPath: /app/data
       volumes:
         - name: config
-          persistentVolumeClaim:
-            claimName: workbuddy2api-config
+          configMap:
+            name: workbuddy2api-config
         - name: auths
           persistentVolumeClaim:
             claimName: workbuddy2api-auths
         - name: pool
           persistentVolumeClaim:
             claimName: workbuddy2api-pool
-        - name: template
-          configMap:
-            name: workbuddy2api-config-template
 
 ---
 # 只集群内可达。下游客户端应该连**面板**的 /v1（密钥、配额、日志都在面板侧），

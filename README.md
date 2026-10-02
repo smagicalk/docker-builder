@@ -266,11 +266,11 @@ kubectl -n workbuddy logs deploy/workbuddy-manager | grep -A2 密码
 kubectl -n workbuddy port-forward svc/workbuddy-manager 7864:7864
 ```
 
-四块卷都是 `hostPath`（路径固定、`Retain` 不自动删）、**每个组件各自独享**：
+三块卷都是 `hostPath`（路径固定、`Retain` 不自动删）、**每个组件各自独享**（`config.json`
+不占卷 —— 它是只读的 ConfigMap）：
 
 | 卷 | 宿主机路径 | 挂给谁 | 里面是什么 |
 |---|---|---|---|
-| `workbuddy2api-config` 1Gi | `/srv/workbuddy/upstream/config` | 上游 `/app/config.json` | `config.json`（全部配置） |
 | `workbuddy2api-auths` 1Gi | `/srv/workbuddy/upstream/auths` | 上游 `/app/auths` | 账号凭证（**最该备份的**） |
 | `workbuddy2api-pool` 1Gi | `/srv/workbuddy/upstream/pool` | 上游 `/app/data` | `state.json`、成本账本 |
 | `workbuddy-manager-data` 5Gi | `/srv/workbuddy/manager/data` | 面板 `/app/data` | SQLite 库、`users.json` |
@@ -281,7 +281,7 @@ kubectl -n workbuddy port-forward svc/workbuddy-manager 7864:7864
 | 面板功能 | 拆开后 | 替代做法 |
 |---|---|---|
 | 扫码「添加账号」 | ✗ **看似成功**：会写进面板容器自己的目录，上游读不到（显示「未加载」）、重启即丢 —— 清单里已用只读空卷把它变成硬报错 | 上游容器内执行 `./login.sh --realm=cn` |
-| 「设置」页保存 | ✗ 读不到 `config.json` → 报错并锁定保存 | `kubectl cp` 改 `config.json` 再重启上游 |
+| 「设置」页保存 | ✗ 读不到 `config.json` → 报错并锁定保存 | 改 ConfigMap + 重启上游 |
 | 重启上游 / 读上游日志 / 一键更新 / 端口收敛 | ✗ 降级提示（k8s 里没有 docker 守护进程） | `kubectl -n workbuddy logs`、`rollout restart` |
 | 仪表盘、账号列表、密钥、日志、用量、IP 管控、模型中心、测试台 | ✓ 照常 | 只走 HTTP，不受影响 |
 
@@ -304,7 +304,7 @@ kubectl -n workbuddy port-forward svc/workbuddy-manager 7864:7864
 | 卷属主 | `fsGroup: 10001` | 等价于 Docker 那步 `chown -R 10001:10001`，不用手工改 |
 | 上游探针 | **TCP 探针**，不用 `/healthz` | `/healthz` 空池返回 503：当 liveness 会反复重启，当 readiness 会让加账号都做不了 |
 | 面板探针 | `httpGet /api/healthz` | 该接口只返回 `{ok: true}`、不依赖上游，所以上游挂了面板仍 Ready |
-| api_key | Secret 是唯一真源：上游 init 容器每次启动写进 `config.json`，面板读 `WB2API_KEY` | 上游的 `login.sh` 只认文件，面板要能鉴权；同一个 Secret 才不会各说一套 |
+| api_key | Secret 是唯一真源：上游用 `WB2A_API_KEY` 环境变量，面板用 `WB2API_KEY` | 两处都指向同一个 Secret，不会各说一套；`config.json` 里的 api_key 恒被忽略 |
 
 ---
 

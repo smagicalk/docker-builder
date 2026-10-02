@@ -15,18 +15,11 @@
 #   · 「扫码添加账号」→ 改用上游容器内登录：
 #       kubectl -n workbuddy exec -it deploy/workbuddy2api -- ./login.sh --realm=cn
 #       （加完不用重启：上游每 5 秒扫一次 auths/，自动进池）
-#   · 「设置页保存」→ 直接改上游的 config.json，再重启上游。两种做法：
-#       ① 拽到本机改好再塞回去（顺手；容器里有 tar）
-#          POD=$(kubectl -n workbuddy get pod -l app.kubernetes.io/name=workbuddy2api \
-#                  -o jsonpath='{.items[0].metadata.name}')
-#          kubectl -n workbuddy cp "$POD:/app/config.json" ./config.json
-#          #   ……用你习惯的编辑器改 ./config.json……
-#          kubectl -n workbuddy cp ./config.json "$POD:/app/config.json"
-#          kubectl -n workbuddy rollout restart deploy/workbuddy2api
-#       ② 就地用 python 改一个字段（上游镜像里没有 vi，但有 python3）
-#          kubectl -n workbuddy exec -it deploy/workbuddy2api -- python3 -c \
-#            "import json;p='/app/config.json';c=json.load(open(p));c['schedule']['checkin_hours']=[8,20];json.dump(c,open(p,'w'),ensure_ascii=False,indent=2)"
-#     /app/config.json 是 subPath 单文件挂载，可写，改动会落到配置卷上。
+#   · 「设置页保存」→ 上游的 config.json 现在是**只读的 ConfigMap**，
+#     所以改成「改 ConfigMap + 重启上游」：
+#       kubectl -n workbuddy edit configmap workbuddy2api-config
+#       kubectl -n workbuddy rollout restart deploy/workbuddy2api
+#     （上游只在启动时读一次配置，不重启不生效；api_key 不在这里改，见下。）
 # 其余功能（仪表盘、账号列表、密钥分发、请求日志、用量统计、IP 管控、模型中心、
 # 聊天测试台）全部只走 HTTP，照常可用。
 #
