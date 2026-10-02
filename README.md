@@ -127,23 +127,25 @@ gh workflow run workbuddy2api.yml -f force=true    # 强制重新构建
 
 ## 部署与运行（都在 `deploy/` 下）
 
-本仓库只管**打包上游镜像**；怎么把它跑起来（以及官方面板怎么配），按组件分在三个文件夹里，
-每份都能独立看：
+本仓库只管**打包上游镜像**；怎么把它跑起来（以及官方面板怎么配），都在
+[`deploy/workbuddy/`](deploy/workbuddy/README.md) 下，按组件分开，每份都能独立看：
 
 | 目录 | 内容 |
 |---|---|
-| [`deploy/workbuddy2api/`](deploy/workbuddy2api/README.md) | 上游网关怎么跑：`docker-compose.yml`（只有 `image:`）+ 手册（准备 config / auths / data、属主 10001、起服务、扫码加号、验证、升级） |
-| [`deploy/workbuddy-manager/`](deploy/workbuddy-manager/README.md) | 官方**面板**怎么配：环境变量、怎么连上游、`docker.sock` 挂不挂差在哪、让面板接管 Docker 部署的上游 |
-| [`deploy/k8s/`](deploy/k8s/README.md) | Kubernetes：上游 + 面板**同一个 Pod** 的完整清单（4 PV/PVC、init 容器、2 Service、注释版 Ingress）与全部坑位 |
+| [`deploy/workbuddy/`](deploy/workbuddy/README.md) | **项目总览**：上游 + 面板怎么配合，是下面三份的入口 |
+| [`deploy/workbuddy/workbuddy2api/`](deploy/workbuddy/workbuddy2api/README.md) | 上游网关怎么跑：`docker-compose.yml`（只有 `image:`）+ 手册（准备 config / auths / data、属主 10001、起服务、扫码加号、验证、升级） |
+| [`deploy/workbuddy/workbuddy-manager/`](deploy/workbuddy/workbuddy-manager/README.md) | 官方**面板**怎么配：环境变量、怎么连上游、`docker.sock` 挂不挂差在哪、让面板接管 Docker 部署的上游 |
+| [`deploy/workbuddy/k8s/`](deploy/workbuddy/k8s/README.md) | Kubernetes：上游 + 面板**同一个 Pod** 的完整清单（4 PV/PVC、init 容器、2 Service、注释版 Ingress）与全部坑位 |
 
 三者的关系一句话：上游镜像由**本仓库**构建 →
-[`deploy/workbuddy2api/`](deploy/workbuddy2api/README.md) 讲怎么单独跑它 →
-[`deploy/workbuddy-manager/`](deploy/workbuddy-manager/README.md) 讲面板怎么跟它配对 →
-[`deploy/k8s/`](deploy/k8s/README.md) 把两者放进一个 Pod（共享 `config.json` 与 `auths/`，
+[`workbuddy2api/`](deploy/workbuddy/workbuddy2api/README.md) 讲怎么单独跑它 →
+[`workbuddy-manager/`](deploy/workbuddy/workbuddy-manager/README.md) 讲面板怎么跟它配对 →
+[`k8s/`](deploy/workbuddy/k8s/README.md) 把两者放进一个 Pod（共享 `config.json` 与 `auths/`，
 面板的「扫码加号」「设置页保存」「成长中心任务」在那边才是完整可用的）。
 
 > 只想在单机上跑（不碰 Kubernetes）：看前两个文件夹就够 —— 上游一个 compose，面板一个官方
 > compose（或 `docker run`），两者用同一个 Docker 网络互通。
+
 ## 注意
 
 - **这不是官方镜像。** 上游源码的许可为 MIT，版权归原作者（**Sliverkiss**）；

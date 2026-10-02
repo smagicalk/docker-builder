@@ -1,7 +1,7 @@
 # 上游 workbuddy2api（OpenAI 兼容网关）—— 怎么跑
 
 镜像由本仓库自动构建：`ghcr.io/smagicalk/workbuddy2api:latest`（多架构 amd64 + arm64）。
-标签含义、构建机制、怎么手动触发，见[仓库根 README](../../README.md)。
+标签含义、构建机制、怎么手动触发，见[仓库根 README](../../../README.md)。
 
 | 文件 | 用途 |
 |---|---|

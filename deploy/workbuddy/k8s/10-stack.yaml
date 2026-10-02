@@ -3,7 +3,7 @@
 #       面板 ghcr.io/ithtelab/workbuddy-manager:latest（官方发布，多架构）
 #
 # 部署顺序：00-namespace → 建两个 Secret → 本文件
-#   kubectl apply -f deploy/k8s/
+#   kubectl apply -f deploy/workbuddy/k8s/
 #
 # ── 为什么把两个容器放进同一个 Pod ────────────────────────────────
 # 上游既没有「加账号」的 HTTP 接口，也没有热改配置的接口：面板那两项功能天生要靠
@@ -48,7 +48,7 @@
 #
 # hostPath 最省事、最透明，代价是**数据绑在节点上**：多节点集群里 Pod 可能被调度到另一台
 # 节点，那里看到的是空目录 —— 表现为「账号池变 0、配置回到默认基线」，很像数据丢了。
-# 所以多节点集群必须二选一（写法见 deploy/k8s/README.md 的「多节点集群」一节）：
+# 所以多节点集群必须二选一（写法见 deploy/workbuddy/k8s/README.md 的「多节点集群」一节）：
 #   · 给下面四个 PV 都加 nodeAffinity，把 Pod 钉在有数据的那一台；或
 #   · 换成 NFS / 云盘 CSI（动态供给）：把本文件的 PV 全删掉、给 PVC 填上 storageClassName。
 # reclaimPolicy 一律 Retain：删 PVC **不会**删数据，要清干净得自己上节点删目录。
@@ -217,7 +217,7 @@ spec:
 
 ---
 # ⚠️ 这两个 Secret **故意不放在清单里** —— 请先手动建，再 apply 本文件。
-#    放进去的话，每次 `kubectl apply -f deploy/k8s/` 都会用文件里的占位值把你刚设的
+#    放进去的话，每次 `kubectl apply -f deploy/workbuddy/k8s/` 都会用文件里的占位值把你刚设的
 #    真密钥覆盖回去。密钥的真源只应该有一处。
 #
 #  1) workbuddy2api-secret（**必建**，两个容器都要它）：
@@ -582,7 +582,7 @@ spec:
             # 同样可行（代价只是「更新上游」不可用）；而且在 K8s 里上游是**另一个容器**，
             # 那个仓库目录本来就不存在。面板的全部写入点只落在 config.json、auths/ 与
             # /app/data（另外 /app/.version 是自愈标记，官方 Docker 部署同样落在容器层），
-            # 所以这两条子路径在文件层面是完备的 —— 逐条对照见 deploy/k8s/README.md。
+            # 所以这两条子路径在文件层面是完备的 —— 逐条对照见 deploy/workbuddy/k8s/README.md。
             # 与上游**共享**的配置文件，读写挂载：「设置」页保存要真的落盘。
             # 与上游 /app/config.json 是同一个 inode（不是拷贝）。
             # 保存后由**上游容器里的 supervisor** 在 2~5 秒内优雅重启上游进程，无需手动操作。

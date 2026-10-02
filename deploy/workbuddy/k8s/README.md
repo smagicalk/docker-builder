@@ -58,7 +58,7 @@
 | `10-stack.yaml` | 4 PV + 4 PVC + Deployment（两个容器）+ 2 Service +（注释掉的）Ingress |
 
 ```bash
-kubectl apply -f deploy/k8s/      # 按文件名顺序应用
+kubectl apply -f deploy/workbuddy/k8s/      # 按文件名顺序应用
 ```
 
 ## 存储对应表
@@ -136,7 +136,7 @@ volumes:
 
 ```bash
 # 1) 先建命名空间 —— Secret 是命名空间级的，密钥必须在拉起 Pod 之前就位
-kubectl apply -f deploy/k8s/00-namespace.yaml
+kubectl apply -f deploy/workbuddy/k8s/00-namespace.yaml
 
 # 2) 建两个密钥。**密钥不在清单里**：放进去会被 apply 用占位值覆盖回去
 #    api_key：上游的 WB2A_API_KEY 与面板的 WB2API_KEY 都读它，必建
@@ -149,7 +149,7 @@ kubectl -n workbuddy create secret generic workbuddy-manager-secret \
   --dry-run=client -o yaml | kubectl apply -f -
 
 # 3) 应用整套
-kubectl apply -f deploy/k8s/10-stack.yaml
+kubectl apply -f deploy/workbuddy/k8s/10-stack.yaml
 kubectl -n workbuddy rollout status deploy/workbuddy
 
 # 4) 面板密码：建了 Secret 就是你给的那个；没建就从日志里捞
