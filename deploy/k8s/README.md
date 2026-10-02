@@ -99,12 +99,19 @@ volumes:
 端口收敛（要读宿主机上的 compose 文件）与读上游日志（要读上游 `data/server.err.log`，
 而 `data/` 刻意不共享，见上一节）。
 
+还有一处**不是从上游目录来的**：面板的「成长中心任务」要跑上游自带的
+`scripts/task_runner.py`（官方镜像把它 COPY 在 `/app/scripts/`）。K8s 里面板看不到另一个
+容器的镜像内容，所以清单加了一个 init 容器把它复制到共享卷（emptyDir），面板按官方说的
+「源码部署」路径 `<WB_UPSTREAM_DIR>/scripts/task_runner.py` 找到它 —— 脚本始终来自**同一个
+上游镜像**，版本与上游容器一致（面板作者担心的「手工拷贝会漂移」在这里不成立）。
+
 ## 面板那几项「要靠上游文件」的功能
 
 | 面板功能 | 状态 | 说明 |
 |---|---|---|
 | 扫码「添加账号」 | ✓ 可用 | 写进共享的 `auths/`，上游 5 秒内自动进池，**不用重启** |
 | 「设置」页保存 | ✓ 保存成功，**2~5 秒自动生效** | 上游容器里的 supervisor 盯住文件内容、一变就优雅重启上游进程；界面那句「重载失败」是面板在试 docker，忽略即可 —— 见下节 |
+| 「成长中心任务」（预览 / 一键执行） | ✓ 可用 | init 容器把上游镜像里的 `scripts/*.py` 复制到共享卷，面板按官方说的「源码部署」路径 `<WB_UPSTREAM_DIR>/scripts/task_runner.py` 找到它（实测接口 `available: true`）；脚本零第三方依赖，面板自己的 python3 直接跑 |
 | 上游重启 / 读上游日志 / 端口收敛 / 一键更新 | ✗ 降级报错 | 面板镜像里**有** docker CLI（实测 `/usr/local/bin/docker` + compose v2.40.3），但 K8s 里没有 docker socket/守护进程 → 报 `Cannot connect to the Docker daemon at unix:///var/run/docker.sock`（响亮、不静默）。用 `kubectl` 代替 |
 | 仪表盘、账号列表、密钥分发、请求日志、用量统计、IP 管控、模型中心、聊天测试台 | ✓ 照常 | 只走 HTTP，不受影响 |
 
@@ -304,8 +311,9 @@ spec:
 ## 常见坑
 
 | 现象 | 原因 |
-| 账号池突然变 0、配置回到默认基线 | Pod 被调度到了**另一台节点** —— hostPath 的数据在那台上是空的（init 于是又写了一份新基线）。给四个 PV 加 `nodeAffinity` 钉住有数据的那台，或改用 CSI 存储；见「多节点集群」一节 |
 |---|---|
+| 账号池突然变 0、配置回到默认基线 | Pod 被调度到了**另一台节点** —— hostPath 的数据在那台上是空的（init 于是又写了一份新基线）。给四个 PV 加 `nodeAffinity` 钉住有数据的那台，或改用 CSI 存储；见「多节点集群」一节 |
+| 面板报「未找到上游任务脚本（/app/data/upstream-scripts/task_runner.py）」 | init 容器 `copy-scripts` 没复制成功：`kubectl -n workbuddy logs deploy/workbuddy -c copy-scripts` 看日志（Pod 重启过就加 `--previous`）。只有「成长中心任务」受影响，其他功能照常 |
 | 面板提示 `Cannot connect to the Docker daemon at unix:///var/run/docker.sock` | **预期行为**：面板镜像自带 docker CLI，但 K8s 里没有 docker socket/守护进程 —— 「重载上游 / 读上游日志 / 一键更新 / 端口收敛」都会降级成这句。用 `kubectl -n workbuddy logs`、`rollout restart`、`port-forward` 代替 |
 | 刷新令牌后出现「上游重载失败：…Cannot connect to the Docker daemon…请在宿主机重启上游容器」 | **不用处理**：这句针对的是面板顺手触发的「重启上游」——`server/services/reload.py` 开头写明账号类改动也会触发一次重启（好让旧上游不必等那 5 秒轮询），K8s 里没有 docker 所以必然失败。而上游对 `auths/` 是**热加载**（2026-09-18 起每 5 秒轮询目录指纹，`internal/pool/watch.go`），新令牌最多 5 秒进池；配置类改动则由上游容器里的 supervisor 自动生效 —— 这个提示一律可以忽略 |
 | 面板提示「上游配置里声明的账号目录与本站读取的不一致，管理端实际以「账号目录」为准」 | **预期现象，不是配错**：面板把 config.json 里的 `auth_dir`（官方默认就是相对路径 `./auths`）与自己的 `WB_AUTH_DIR`（默认绝对路径 `/opt/workbuddy2api/auths`）做**字面**比较（`server/services/wb2api.py` 的 `load_upstream_config`），字面不同就带上 `upstream_auth_dir` 让界面提示。两边其实是**同一块卷**：上游的 CWD 是 `/app`，`./auths` 即 `/app/auths`；面板读的 `/opt/workbuddy2api/auths` 就是那块共享的 auths 卷。**官方 Docker 部署同样会显示这句**（它也不覆盖 `WB_AUTH_DIR`），而面板行为正确 —— 它就以自己的账号目录为准 |

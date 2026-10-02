@@ -15,6 +15,9 @@
 #     和上游的 /app/auths 是同一块卷 —— 面板写进去，上游每 5 秒扫一次自动进池；
 #   · 「设置」页保存回来了：面板与上游读写的是**同一个 config.json**（同一个 inode）。
 #     改完由上游容器里的 supervisor **自动生效**（2~5 秒）—— 见下面 workbuddy2api 容器的 command/args。
+#   · 「成长中心任务」也有脚本可用：init 容器把上游镜像里的 scripts/ 复制到共享卷，
+#     面板按「源码部署」路径 <WB_UPSTREAM_DIR>/scripts/task_runner.py 找到它
+#     （脚本零第三方依赖，面板自己的 python3 就能跑）。
 #
 # 代价（这些若对你更重要，就该拆回两个 Deployment，本目录历史版本就是这么做的）：
 #   · **Pod Ready 是聚合的**：Service 的 endpoint 以 Pod 为单位 —— 上游容器崩了，整个
@@ -339,6 +342,34 @@ spec:
           volumeMounts:
             - name: config
               mountPath: /cfg
+
+        # 把上游镜像里的 scripts/（成长任务脚本）复制给面板用 —— 面板的「成长中心任务」
+        # 按「源码部署」路径 `<WB_UPSTREAM_DIR>/scripts/task_runner.py` 找它。脚本零第三方
+        # 依赖（纯标准库，面板 taskrun.py 的注释也这么写），面板自己的 python3 就能跑。
+        # 每次 Pod 启动都会重新复制：上游镜像更新 + rollout restart 之后自动同步，不会漂移。
+        - name: copy-scripts
+          image: ghcr.io/smagicalk/workbuddy2api:latest
+          imagePullPolicy: Always
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -u
+              # 用普通 cp：容器以 uid 10001 运行，`cp -a` 想保留 root 属主会报
+              # "can't preserve ownership" 并以非零码退出。kubelet 给 emptyDir 的权限是
+              # 0777（再叠加 Pod 的 fsGroup 10001），正常可写。
+              # **软失败**：这只是「成长中心任务」用的便利脚本，复制不成功不该挡住整个 Pod
+              # 启动 —— 面板那边会明确显示「未找到上游任务脚本」，其他功能不受影响。
+              if cp /app/scripts/*.py /out/ 2>/dev/null; then
+                chmod 0644 /out/*.py 2>/dev/null || true
+                echo "[init] 已复制成长任务脚本:"
+                ls -l /out
+              else
+                echo "[init] ⚠️ 复制成长任务脚本失败：面板的「成长中心任务」将不可用（其他功能不受影响）"
+                ls -ld /out || true
+              fi
+          volumeMounts:
+            - name: upstream-scripts
+              mountPath: /out
       containers:
         # ── 上游网关 ────────────────────────────────────────────────
         - name: workbuddy2api
@@ -569,6 +600,12 @@ spec:
             # 自动进池（不用重启）。这里是真目录，不是旧版本里那个「只读空卷」。
             - name: auths
               mountPath: /opt/workbuddy2api/auths
+            # 成长任务脚本（init 容器从上游镜像复制进来的）：面板按「源码部署」路径
+            # `<WB_UPSTREAM_DIR>/scripts/task_runner.py` 找到它 —— 于是「成长中心任务」可用，
+            # 而且面板不会再走需要 docker 的 `docker cp` 提取那条路。
+            - name: upstream-scripts
+              mountPath: /opt/workbuddy2api/scripts
+              readOnly: true
       volumes:
         - name: config
           persistentVolumeClaim:
@@ -582,6 +619,12 @@ spec:
         - name: manager-data
           persistentVolumeClaim:
             claimName: workbuddy-manager-data
+        # 上游镜像里的成长任务脚本（`/app/scripts/*.py`）：由 init 容器复制进来，供**面板**用。
+        # 为什么要复制：K8s 里面板看不到上游容器的 `/app/scripts`（那是镜像内容，不是卷），
+        # 而面板的「成长中心任务」要按「源码部署」那条路去找 `<WB_UPSTREAM_DIR>/scripts/`。
+        # 从**同一个上游镜像**复制，所以版本永远与上游容器一致（不是手工拷贝，不会漂移）。
+        - name: upstream-scripts
+          emptyDir: {}
 
 ---
 # 面板：整套部署的对外入口（下面的 Ingress 指向它）。

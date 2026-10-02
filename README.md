@@ -293,6 +293,7 @@ kubectl -n workbuddy port-forward svc/workbuddy-manager 7864:7864
 | 两个容器 | 同一个 Pod | 共享 RWO 卷不需要 `podAffinity`（同一个 Pod 不可能跨节点）；面板可直接连 `127.0.0.1:7863` |
 | 同 Pod 的代价 | Pod Ready 聚合、镜像拉取是单点、只能整 Pod 重启 | 上游容器崩了，面板的 Service 也会失去 endpoint —— 更看重「面板独立可用」就按 README 里的「拆成两套部署」拆开 |
 | 配置生效 | 上游容器里跑一个 supervisor（清单里的 `command/args`），盯 `config.json` 的内容哈希，一变就优雅重启上游进程 | 「保存即生效」（2~5 秒），不必重启 Pod、面板不中断；上游的优雅停机保证不掐断在途请求 |
+| 成长任务脚本 | init 容器从**上游镜像**复制 `/app/scripts/*.py` 到共享卷（emptyDir），面板按官方说的「源码部署」路径找到它 | 面板「成长中心任务」在 K8s 下可用，且脚本版本与上游容器永远一致；复制失败只降级这一个功能，不挡 Pod 启动（实测 `available: true`） |
 | 卷属主 | `fsGroup: 10001` | 等价于 Docker 那步 `chown -R 10001:10001`，不用手工改 |
 | hostPath 与多节点 | 四个 PV 都要加 `nodeAffinity` 钉到**同一台**节点，或改用 CSI 存储 | 不钉的话 Pod 落到别的节点会看到空目录：账号池变 0、配置回默认基线 —— 很像数据丢了（数据其实在另一台上） |
 | 上游探针 | **TCP 探针**，不用 `/healthz` | `/healthz` 空池返回 503：当 liveness 会反复重启，当 readiness 会让加账号都做不了 |
