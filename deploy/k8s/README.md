@@ -58,13 +58,54 @@ kubectl apply -f deploy/k8s/      # 按文件名顺序应用
 **前两块是共享的**（面板与上游都挂）；`pool` 刻意不给面板：那是上游进程的活状态，
 两个进程同时写只会互相覆盖（面板的写入是 tmp+rename，会被上游内存态直接盖掉）。
 
+## 与官方 docker-compose 的对应关系
+
+官方 [`docker-compose.yml`](https://github.com/ithtelab/workbuddy-manager/blob/main/docker-compose.yml)
+给面板挂的是**上游整个仓库目录**：
+
+```yaml
+volumes:
+  - ./data:/app/data                              # 面板数据
+  - ../workbuddy2api:/opt/workbuddy2api           # 上游整个目录（读 + 写）
+  - /var/run/docker.sock:/var/run/docker.sock     # 可选：挂上才能重载/更新上游
+```
+
+它自己在注释里就写明了替代做法：
+
+> 若你**不想**让管理端碰上游仓库（例如上游由别人维护），改成只挂 `config.json` 与 `auths/`
+> 两条子路径即可：此时「更新上游」会不可用，界面会如实提示。
+
+本目录就是那个替代做法 —— K8s 里没有「上游仓库目录」这个概念（上游是另一个容器、另一个镜像），
+所以只挂那两条子路径：
+
+| 官方 compose | 本清单 |
+|---|---|
+| `../workbuddy2api:/opt/workbuddy2api`（整个目录） | `config.json`（subPath、**可写**）＋ `auths/`（**可写**）两条子路径 |
+| `./data:/app/data` | PVC `workbuddy-manager-data` → `/app/data` |
+| `docker.sock`（可选） | 没有也不可能有 → 重载 / 更新 / 读日志 / 端口收敛按官方说的「降级并如实提示」 |
+| **不设** `WB_UPSTREAM_CONFIG` / `WB_AUTH_DIR` / `WB_UPSTREAM_DIR`（靠默认值指向 `/opt/workbuddy2api/*`） | **同样不设** —— 默认值正好命中挂载点，零覆盖 |
+
+**为什么两条子路径就够**（不是推断：把面板源码的写入点全部过了一遍）：
+
+| 面板写到哪 | 实际路径 | 本清单 |
+|---|---|---|
+| SQLite 库、`users.json`、`update-*`、`version-check.json`、`upstream-scripts/` | `/app/data`（`config.DATA_DIR`） | ✓ 已挂 |
+| 上游配置（「设置」页保存） | `/opt/workbuddy2api/config.json` | ✓ 已挂（可写） |
+| 账号凭证（扫码落盘） | `/opt/workbuddy2api/auths/`（`mkdir` + tmp+rename 原子写） | ✓ 已挂（可写） |
+| 版本标记 `.version` | `/app/.version`（`config.ROOT`；写失败会自愈） | 容器层，无影响（官方也一样：`/app` 不是卷） |
+
+**没有任何写入会落到 `/opt/workbuddy2api` 下的其它路径** —— 这是「两条子路径完备」的依据。
+剩下的差异只有官方列出的那一项（「更新上游」不可用），外加 K8s 里本来就不成立的两项：
+端口收敛（要读宿主机上的 compose 文件）与读上游日志（要读上游 `data/server.err.log`，
+而 `data/` 刻意不共享，见上一节）。
+
 ## 面板那几项「要靠上游文件」的功能
 
 | 面板功能 | 状态 | 说明 |
 |---|---|---|
 | 扫码「添加账号」 | ✓ 可用 | 写进共享的 `auths/`，上游 5 秒内自动进池，**不用重启** |
 | 「设置」页保存 | ✓ 保存成功，⚠️ **生效要重启** | 上游只在启动时读一次配置，没有热重载 —— 见下节 |
-| 上游重启 / 读上游日志 / 端口收敛 / 一键更新 | ✗ 降级报错 | K8s 里没有 docker 守护进程，面板也看不到上游工作目录；用 `kubectl` 代替 |
+| 上游重启 / 读上游日志 / 端口收敛 / 一键更新 | ✗ 降级报错 | 面板镜像里**有** docker CLI（实测 `/usr/local/bin/docker` + compose v2.40.3），但 K8s 里没有 docker socket/守护进程 → 报 `Cannot connect to the Docker daemon at unix:///var/run/docker.sock`（响亮、不静默）。用 `kubectl` 代替 |
 | 仪表盘、账号列表、密钥分发、请求日志、用量统计、IP 管控、模型中心、聊天测试台 | ✓ 照常 | 只走 HTTP，不受影响 |
 
 ## 部署
@@ -116,7 +157,7 @@ kubectl -n workbuddy exec -it deploy/workbuddy -c workbuddy2api -- ./login.sh --
 kubectl -n workbuddy rollout restart deploy/workbuddy
 ```
 
-面板在保存后还会自己尝试「重启上游容器」，这一步在 K8s 里**必然失败**（没有 docker），
+面板在保存后还会自己尝试「重启上游容器」，这一步在 K8s 里**必然失败**（有 docker CLI，但没有 socket/守护进程），
 界面会提示重载失败 —— **那不是保存失败**，按上面那行命令重启即可。
 
 也可以绕开面板。两条路，随你：
@@ -254,6 +295,7 @@ spec:
 | 现象 | 原因 |
 | 账号池突然变 0、配置回到默认基线 | Pod 被调度到了**另一台节点** —— hostPath 的数据在那台上是空的（init 于是又写了一份新基线）。给四个 PV 加 `nodeAffinity` 钉住有数据的那台，或改用 CSI 存储；见「多节点集群」一节 |
 |---|---|
+| 面板提示 `Cannot connect to the Docker daemon at unix:///var/run/docker.sock` | **预期行为**：面板镜像自带 docker CLI，但 K8s 里没有 docker socket/守护进程 —— 「重载上游 / 读上游日志 / 一键更新 / 端口收敛」都会降级成这句。用 `kubectl -n workbuddy logs`、`rollout restart`、`port-forward` 代替 |
 | PV 一直 `Pending` / PVC 绑不上 | `claimRef.namespace` 写错（换过命名空间？），或 PV 与 PVC 的 `storageClassName` 不一致 —— 静态供给时两边必须**同时**为空字符串或同时填同一个名字 |
 | Pod `CreateContainerConfigError` | 少了 `workbuddy2api-secret`（两个容器都要它） |
 | 「设置页显示已保存，但上游行为没变」 | 忘了重启：`kubectl -n workbuddy rollout restart deploy/workbuddy`（配置只在启动时读一次） |
