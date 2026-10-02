@@ -486,6 +486,12 @@ spec:
             # 面板自己的数据：SQLite + users.json。必须持久化。
             - name: manager-data
               mountPath: /app/data
+            # 这里挂的是**两条子路径**（config.json 单文件 + auths 目录），不是整个目录：
+            # 官方 docker-compose 挂的是「上游整个仓库目录」，但它在注释里写明这条替代做法
+            # 同样可行（代价只是「更新上游」不可用）；而且在 K8s 里上游是**另一个容器**，
+            # 那个仓库目录本来就不存在。面板的全部写入点只落在 config.json、auths/ 与
+            # /app/data（另外 /app/.version 是自愈标记，官方 Docker 部署同样落在容器层），
+            # 所以这两条子路径在文件层面是完备的 —— 逐条对照见 deploy/k8s/README.md。
             # 与上游**共享**的配置文件，读写挂载：「设置」页保存要真的落盘。
             # 与上游 /app/config.json 是同一个 inode（不是拷贝），但上游只在启动时读
             # 一次配置 —— 保存成功后要重启上游才生效。
