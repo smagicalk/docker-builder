@@ -256,7 +256,7 @@ kubectl -n workbuddy create secret generic workbuddy2api-secret \
   --from-literal=api_key="$(openssl rand -hex 32)" \
   --dry-run=client -o yaml | kubectl apply -f -
 
-# 2) 整套（4 PV/PVC + 配置种子 + 两个容器 + 2 Service）
+# 2) 整套（4 PV/PVC + 两个容器 + 2 Service；配置由 init 容器在首次部署时写一份默认基线）
 kubectl apply -f deploy/k8s/10-stack.yaml
 
 # 3) 打开面板：首启随机密码在日志里（建了 manager-secret 就是你给的那个）

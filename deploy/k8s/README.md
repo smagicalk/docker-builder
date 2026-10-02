@@ -38,7 +38,7 @@
 | 文件 | 内容 |
 |---|---|
 | `00-namespace.yaml` | 命名空间 `workbuddy`（PV 的 `claimRef` 依赖它） |
-| `10-stack.yaml` | 4 PV + 4 PVC + ConfigMap（配置种子）+ Deployment（两个容器）+ 2 Service +（注释掉的）Ingress |
+| `10-stack.yaml` | 4 PV + 4 PVC + Deployment（两个容器）+ 2 Service +（注释掉的）Ingress |
 
 ```bash
 kubectl apply -f deploy/k8s/      # 按文件名顺序应用
@@ -50,7 +50,7 @@ kubectl apply -f deploy/k8s/      # 按文件名顺序应用
 
 | PV / PVC | 存储（宿主机路径） | 挂载点 | 里面是什么 | 丢了会怎样 |
 |---|---|---|---|---|
-| `workbuddy2api-config`（1Gi） | `/srv/workbuddy/upstream/config` | 上游 `/app/config.json`（只读）+ 面板 `/opt/workbuddy2api/config.json`（读写） | `config.json`（上游全部配置） | 由 init 容器从 ConfigMap 重新播种（密钥不在里面） |
+| `workbuddy2api-config`（1Gi） | `/srv/workbuddy/upstream/config` | 上游 `/app/config.json`（只读）+ 面板 `/opt/workbuddy2api/config.json`（读写） | `config.json`（上游全部配置，**配置的唯一真源**） | 由 init 容器写一份默认基线（密钥不在里面） |
 | `workbuddy2api-auths`（1Gi） | `/srv/workbuddy/upstream/auths` | 上游 `/app/auths` + 面板 `/opt/workbuddy2api/auths` | 每个账号一份凭证 `workbuddy-<uid>.json` | **要重新扫码加号** —— 最该备份的一个 |
 | `workbuddy2api-pool`（1Gi） | `/srv/workbuddy/upstream/pool` | 上游 `/app/data`（面板**不挂**） | `state.json`（积分/冷却/熔断）、`model.json`（成本账本） | 不致命，冷却与便宜号账本要重新学 |
 | `workbuddy-manager-data`（5Gi） | `/srv/workbuddy/manager/data` | 面板 `/app/data` | `manager.db`（密钥/日志/用量/审计）、`users.json`（管理员 + 会话签名密钥） | 要重新初始化管理员、已发会话全部失效、统计与审计丢失 |
@@ -119,18 +119,25 @@ kubectl -n workbuddy rollout restart deploy/workbuddy
 面板在保存后还会自己尝试「重启上游容器」，这一步在 K8s 里**必然失败**（没有 docker），
 界面会提示重载失败 —— **那不是保存失败**，按上面那行命令重启即可。
 
-也可以绕开面板，直接改宿主机上的文件（`hostPath` 是节点上的真实路径）：
+也可以绕开面板。两条路，随你：
 
 ```bash
-# 在数据所在的那台节点上
+# ① 上节点直接改文件（hostPath 是节点上的真实路径）
 sudo vi /srv/workbuddy/upstream/config/config.json
+kubectl -n workbuddy rollout restart deploy/workbuddy
+
+# ② 把本地准备好的一份文件灌进容器（适合把配置放进 Git 管理）
+kubectl -n workbuddy exec -i deploy/workbuddy -c workbuddy-manager -- \
+  sh -c 'cat > /opt/workbuddy2api/config.json' < my-config.json
 kubectl -n workbuddy rollout restart deploy/workbuddy
 ```
 
-三点注意：
+> 两条路改的都是**同一个文件**（面板读写的就是它）：改动永久生效，只是上游要重启才会读到。
 
-- `config.json` 挂载走 `subPath`（单文件），**ConfigMap 里的那份只是一次性种子**：
-  改 ConfigMap 只影响「全新部署」，对已经在跑的配置没有任何影响；
+四点注意：
+
+- **`config.json` 的唯一真源就是卷上的这个文件** —— 清单里没有 ConfigMap 那一层「改了却对运行中的部署没用」的影子副本；面板保存、你改宿主机文件、或者把一份新文件灌进容器，写进去的内容都**永久保留**；
+- 全新部署（文件还不存在）时由 init 容器写一份默认基线，之后它不再插手；
 - **`api_key` 别在文件里改**：它恒被 `WB2A_API_KEY` 覆盖（真源是 Secret），留空即可；
 - 别忘了重启：症状是**「设置页显示已保存、上游行为没变」**，很难查。
 
@@ -224,11 +231,11 @@ kubectl -n workbuddy rollout restart deploy/workbuddy
 | PV 一直 `Pending` / PVC 绑不上 | `claimRef.namespace` 写错（换过命名空间？），或 PV 与 PVC 的 `storageClassName` 不一致 —— 静态供给时两边必须**同时**为空字符串或同时填同一个名字 |
 | Pod `CreateContainerConfigError` | 少了 `workbuddy2api-secret`（两个容器都要它） |
 | 「设置页显示已保存，但上游行为没变」 | 忘了重启：`kubectl -n workbuddy rollout restart deploy/workbuddy`（配置只在启动时读一次） |
-| 在 ConfigMap 里改配置不生效 | 那份 ConfigMap 只是**一次性种子**（挂载走 `subPath`）：只影响全新部署；运行中的配置以卷上的文件为准 |
-| 在 ConfigMap / config.json 里改 `api_key` 不生效 | 密钥由 Secret 经 `WB2A_API_KEY` 注入，**文件里的 api_key 恒被忽略**；换密钥只能改 Secret |
+| `config.json` 不见了 / 配置被清空 | 配置卷空了：init 容器会**重新写入一份默认基线**（等于恢复出厂配置）。只有文件不存在时才会这样，正常改动造成的偏差不会被它覆盖 |
+| 在 `config.json` 里改 `api_key` 不生效 | 密钥由 Secret 经 `WB2A_API_KEY` 注入，**文件里的 api_key 恒被忽略**；换密钥只能改 Secret |
 | 面板「设置」保存报权限错误（Permission denied） | 宿主机上的 `config.json` 是别的用户（比如 root）建的，容器里的 10001 改不动：上节点 `chown -R 10001:10001 /srv/workbuddy/upstream/config` |
 | 账号数是 0，但 `auths/` 里明明有文件 | 卷属主不对（`fsGroup` 在 hostPath 这类卷上可能不生效）：上节点 `chown -R 10001:10001 /srv/workbuddy/upstream/auths` |
-| 面板保存时报「未找到上游配置文件 …」并锁定配置项 | `/opt/workbuddy2api/config.json` 没挂上（比如 PVC 没绑、init 容器没播种成功）：`kubectl -n workbuddy exec deploy/workbuddy -c workbuddy-manager -- ls -l /opt/workbuddy2api` |
+| 面板保存时报「未找到上游配置文件 …」并锁定配置项 | `/opt/workbuddy2api/config.json` 没挂上（PVC 没绑，或 init 容器没写出基线）：`kubectl -n workbuddy exec deploy/workbuddy -c workbuddy-manager -- ls -l /opt/workbuddy2api`；init 的日志：`kubectl -n workbuddy logs deploy/workbuddy -c init-config`（已完成 Pod 用 `--previous`） |
 | 想扩副本 | **别扩**。账号池是单实例本地状态，多副本会重复跑定时任务并争抢 `state.json`；真要扩容先关掉 `config.json` 里的 `schedule.*` |
 | 面板显示「上游不可用」 | `kubectl -n workbuddy exec deploy/workbuddy -c workbuddy-manager -- curl -s http://127.0.0.1:7863/healthz`。注意 503 = 上游在跑但没有可用账号，不是连不上 |
 | 改 Service 的 `targetPort` 时报找不到端口 | 两个容器都用**命名端口**，名字必须互不相同（上游 `api`、面板 `web`）：同名时 Service 分不清该指向哪个容器 |

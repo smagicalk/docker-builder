@@ -30,7 +30,7 @@
 #   PV workbuddy2api-config    hostPath /srv/workbuddy/upstream/config   1Gi  ← 共享
 #      → 上游 /app/config.json（单文件 subPath、只读）＋ 面板 /opt/workbuddy2api/config.json（读写）
 #      里面放：config.json（上游全部配置：定时任务 / 限流 / 并发 / 提示词 …）
-#      丢了会怎样：由 init 容器从 ConfigMap workbuddy2api-config-seed 重新播种（密钥不在里面）
+#      丢了会怎样：由 init 容器写一份默认基线（密钥不在里面）
 #   PV workbuddy2api-auths     hostPath /srv/workbuddy/upstream/auths    1Gi  ← 共享
 #      → 上游 /app/auths ＋ 面板 /opt/workbuddy2api/auths
 #      里面放：auths/workbuddy-<uid>.json（每个账号一份凭证）
@@ -50,7 +50,7 @@
 # storageClassName 即可（写法见 deploy/k8s/README.md）。
 # reclaimPolicy 一律 Retain：删 PVC **不会**删数据，要清干净得自己上节点删目录。
 #
-# ── 四个必须知道的点 ──────────────────────────────────────────────
+# ── 五个必须知道的点 ──────────────────────────────────────────────
 #   1. replicas 固定 1，别直接扩。账号池是「单进程本地状态 + 本地 auths 目录」：多副本会
 #      各自把定时任务跑一遍（重复签到/领奖，还有 WAF 风险），并争抢同一份 state.json。
 #      真要扩容，先关掉 config.json 里的 schedule.* 开关。
@@ -58,13 +58,17 @@
 #      返回 503（应用层语义，见上游 handler.go 的 Pool.ServableNow()），当 liveness 会让
 #      Pod 反复重启，当 readiness 会让「还没加账号」时 Service 不转发、连登录加号都做不了。
 #      面板用 /api/healthz（源码 server/routers/auth.py 只返回 {'ok': True}，不依赖上游）。
-#   3. 面板的另一个「看着像成功其实没用」的坑已经没有了：auths/ 现在是真的共享目录，
+#   3. 配置有**唯一真源**：配置卷上的 config.json。清单里**没有** ConfigMap 那一层
+#      —— 那种「改了却对运行中的部署没用」的影子副本最容易骗人。所以：
+#        面板「设置」页保存 或 直接改宿主机上的那个文件 → **永久生效**，重启不丢；
+#        但上游只在启动时读一次配置，改完要重启才生效：
+#          kubectl -n workbuddy rollout restart deploy/workbuddy
+#   4. 面板的另一个「看着像成功其实没用」的坑已经没有了：auths/ 现在是真的共享目录，
 #      写进去上游读得到（旧版本给 /opt/workbuddy2api 挂只读空卷正是为了挡住它）。
-#   4. 上游的「重启上游 / 读上游日志 / 一键更新」这几个面板功能在 K8s 下会降级报错
+#   5. 上游的「重启上游 / 读上游日志 / 一键更新」这几个面板功能在 K8s 下会降级报错
 #      （没有 docker 守护进程，也没有上游工作目录），用 kubectl 代替，见 README。
-
 ---
-# 配置卷：**两个容器共享** —— 面板「设置」页保存改的就是这个文件，上游启动时读它。
+# 配置卷：**两个容器共享的唯一真源** —— 面板「设置」页保存改的就是这个文件，上游启动时读它。
 apiVersion: v1
 kind: PersistentVolume
 metadata:
@@ -240,98 +244,6 @@ spec:
 #   api_key: "换成你自己的随机值（openssl rand -hex 32）"
 
 ---
-# 配置的**初始模板**：只在配置卷上还没有 config.json 时，由 init 容器播种一次。
-# 之后配置以**卷上的那个文件**为准（面板「设置」页保存改的就是它）。
-#   · api_key 故意留空 —— 真值由 Secret 经 WB2A_API_KEY 注入，所以这个 ConfigMap 里
-#     没有任何密钥，可以安全地进版本库。
-#   · 这个 ConfigMap **不会**自动同步进容器（挂载走 subPath）：它只是一次性种子，
-#     改它只影响「全新部署」，不影响已经在跑的配置。
-#   · 改完配置要重启上游（只有启动时读一次，没有热重载）：
-#       kubectl -n workbuddy rollout restart deploy/workbuddy
-# 缺的字段会走上游内置默认值（含那套默认定时任务）。
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: workbuddy2api-config-seed
-  namespace: workbuddy
-data:
-  config.json: |
-    {
-      "listen": ":7863",
-      "api_key": "",
-      "auth_dir": "./auths",
-      "state_file": "./data/state.json",
-      "cooldown": {
-        "soft_rate": "600s",
-        "soft_rate_max": "2h"
-      },
-      "schedule": {
-        "checkin_hours": [9, 21],
-        "travel_hours": [9, 21],
-        "activity_hours": [10],
-        "keepalive_hours": [22],
-        "school_hours": [12],
-        "cat_hours": [1],
-        "checkin_enabled": true,
-        "travel_enabled": true,
-        "activity_enabled": true,
-        "keepalive_enabled": true,
-        "school_enabled": true,
-        "cat_enabled": true
-      },
-      "admin": {
-        "enabled": false
-      },
-      "global": {
-        "enabled": true,
-        "chat_base": "",
-        "billing_base": ""
-      },
-      "upstream": {
-        "timeout_seconds": 120,
-        "header_timeout_seconds": 120,
-        "idle_timeout_seconds": 300,
-        "user_agent": "",
-        "client_version": "",
-        "cli_version": "",
-        "device_token": "",
-        "device_token_file": "",
-        "client_name": "WorkBuddy",
-        "passthrough_ip": false
-      },
-      "features": {
-        "sanitize_blacklist_fingerprints": true
-      },
-      "prompt": {
-        "mode": "passthrough",
-        "file": ""
-      },
-      "upstash": {
-        "url": "",
-        "token": ""
-      },
-      "pool": {
-        "max_in_flight": 3,
-        "max_in_flight_global": 2,
-        "breaker_threshold": 3,
-        "breaker_cooldown": "30m",
-        "breaker_cooldown_max": "6h",
-        "degrade_threshold": 5,
-        "degrade_cooldown": "10m",
-        "degrade_cooldown_max": "2h",
-        "idle_weight_per_hour": 0.5,
-        "idle_weight_max": 5.0,
-        "expiring_soon": "168h",
-        "cost_explore_interval": "30m"
-      },
-      "session_sticky": {
-        "enabled": true,
-        "ttl": "30m",
-        "gc_interval": "5m"
-      }
-    }
-
----
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -364,28 +276,63 @@ spec:
         runAsGroup: 10001
         fsGroup: 10001
       # 初始化容器：配置卷（hostPath）初始是空目录，而两个容器都用 subPath 挂**单个文件**，
-      # 文件不存在会直接挂载失败 —— 所以先由它把 config.json 播种出来。
-      # 只在文件不存在时播种；之后面板（或你）改的内容不会被覆盖。
+      # 文件不存在会直接挂载失败 —— 所以先由它写一份默认基线出来。
+      # 只写一次：之后这个文件就是配置的唯一真源（面板保存的内容不会被覆盖）。
       initContainers:
-        - name: seed-config
+        - name: init-config
           image: ghcr.io/smagicalk/workbuddy2api:latest
           imagePullPolicy: Always
           command: ["/bin/sh", "-c"]
           args:
             - |
               set -eu
+              # 配置的**唯一真源**就是卷上的 /cfg/config.json（下面两个容器共享的那一份）。
+              # 这里只在它不存在时（全新部署 / 卷被清空）写一份默认基线 —— 没有 ConfigMap
+              # 那层「改了却没用」的影子副本：此后面板「设置」页保存、或你直接改宿主机上的
+              # 文件，写进去的内容**永久保留**，任何一次重启都不会被别的东西覆盖回去。
+              # 唯一的例外是你自己删掉这个文件：那会被当作全新部署，重新写入下面的基线。
               if [ -f /cfg/config.json ]; then
-                echo "[init] 配置卷上已有 config.json，保持不动"
-              else
-                echo "[init] 从 ConfigMap 播种 config.json"
-                cp /seed/config.json /cfg/config.json
+                echo "[init] 配置卷上已有 config.json，保持不动（它是唯一真源）"
+                exit 0
               fi
+              echo "[init] 配置卷上还没有 config.json：写入一份默认基线"
+              # 缺的字段上游会用内置默认值（含那套默认定时任务），所以这几段够用了。
+              printf '%s\n' \
+                '{' \
+                '  "listen": ":7863",' \
+                '  "api_key": "",' \
+                '  "auth_dir": "./auths",' \
+                '  "state_file": "./data/state.json",' \
+                '  "cooldown": { "soft_rate": "600s", "soft_rate_max": "2h" },' \
+                '  "schedule": {' \
+                '    "checkin_hours": [9, 21],' \
+                '    "travel_hours": [9, 21],' \
+                '    "activity_hours": [10],' \
+                '    "keepalive_hours": [22],' \
+                '    "school_hours": [12],' \
+                '    "cat_hours": [1],' \
+                '    "checkin_enabled": true,' \
+                '    "travel_enabled": true,' \
+                '    "activity_enabled": true,' \
+                '    "keepalive_enabled": true,' \
+                '    "school_enabled": true,' \
+                '    "cat_enabled": true' \
+                '  },' \
+                '  "admin": { "enabled": false },' \
+                '  "global": { "enabled": true, "chat_base": "", "billing_base": "" },' \
+                '  "upstream": { "timeout_seconds": 120, "header_timeout_seconds": 120, "idle_timeout_seconds": 300, "user_agent": "", "client_version": "", "cli_version": "", "device_token": "", "device_token_file": "", "client_name": "WorkBuddy", "passthrough_ip": false },' \
+                '  "features": { "sanitize_blacklist_fingerprints": true },' \
+                '  "prompt": { "mode": "passthrough", "file": "" },' \
+                '  "upstash": { "url": "", "token": "" },' \
+                '  "pool": { "max_in_flight": 3, "max_in_flight_global": 2, "breaker_threshold": 3, "breaker_cooldown": "30m", "breaker_cooldown_max": "6h", "degrade_threshold": 5, "degrade_cooldown": "10m", "degrade_cooldown_max": "2h", "idle_weight_per_hour": 0.5, "idle_weight_max": 5.0, "expiring_soon": "168h", "cost_explore_interval": "30m" },' \
+                '  "session_sticky": { "enabled": true, "ttl": "30m", "gc_interval": "5m" }' \
+                '}' > /cfg/config.json
+              # 写完自检：这份基线必须是合法 JSON，否则上游启动会直接失败。
+              python3 -c 'import json; json.load(open("/cfg/config.json")); print("[init] 基线 JSON 校验通过")'
+              ls -l /cfg/config.json
           volumeMounts:
             - name: config
               mountPath: /cfg
-            - name: config-seed
-              mountPath: /seed
-              readOnly: true
       containers:
         # ── 上游网关 ────────────────────────────────────────────────
         - name: workbuddy2api
@@ -554,9 +501,6 @@ spec:
         - name: manager-data
           persistentVolumeClaim:
             claimName: workbuddy-manager-data
-        - name: config-seed
-          configMap:
-            name: workbuddy2api-config-seed
 
 ---
 # 面板：整套部署的对外入口（下面的 Ingress 指向它）。
