@@ -257,6 +257,7 @@ spec:
 | PV 一直 `Pending` / PVC 绑不上 | `claimRef.namespace` 写错（换过命名空间？），或 PV 与 PVC 的 `storageClassName` 不一致 —— 静态供给时两边必须**同时**为空字符串或同时填同一个名字 |
 | Pod `CreateContainerConfigError` | 少了 `workbuddy2api-secret`（两个容器都要它） |
 | 「设置页显示已保存，但上游行为没变」 | 忘了重启：`kubectl -n workbuddy rollout restart deploy/workbuddy`（配置只在启动时读一次） |
+| 面板报 `Unexpected UTF-8 BOM`、设置页锁定 | 那个 `config.json` 带 BOM 了 —— Windows 记事本、PowerShell 5.1 的 `Set-Content -Encoding utf8` 默认都会写 BOM，而面板/上游都用严格 UTF-8 解析。重存为「UTF-8 **无 BOM**」（或用 `printf` / `python3` 写），面板自己保存出来的文件不带 BOM |
 | `config.json` 不见了 / 配置被清空 | 配置卷空了：init 容器会**重新写入一份默认基线**（等于恢复出厂配置）。只有文件不存在时才会这样，正常改动造成的偏差不会被它覆盖 |
 | 在 `config.json` 里改 `api_key` 不生效 | 密钥由 Secret 经 `WB2A_API_KEY` 注入，**文件里的 api_key 恒被忽略**；换密钥只能改 Secret |
 | 面板「设置」保存报权限错误（Permission denied） | 宿主机上的 `config.json` 是别的用户（比如 root）建的，容器里的 10001 改不动：上节点 `chown -R 10001:10001 /srv/workbuddy/upstream/config` |
