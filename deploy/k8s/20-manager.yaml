@@ -39,13 +39,19 @@
 #      里面放：manager.db（密钥 / 日志 / 用量 / 审计）、users.json（管理员与会话签名密钥）
 #      丢了会怎样：要重新初始化管理员、已发会话全部失效、日志与用量统计丢失。
 #
-# ── 关于两个环境变量故意不设 ──────────────────────────────────────
-# 镜像里 WB_AUTH_DIR / WB_UPSTREAM_CONFIG / WB_UPSTREAM_DIR 的默认值指向
-# /opt/workbuddy2api/*，而 k8s 里**没有挂这个目录**，所以：
-#   · 面板读不到上游配置 → 设置页会明确报错并锁定保存
-#   · 账号页的「添加 / 移动 / 删除」会明确报错
-# 这是**预期的降级**，不要用 emptyDir 之类把路径造出来「让它不报错」：
-# 那会让保存操作看起来成功了，而上游根本读不到 —— 比报错更糟。
+# ── 「上游目录」刻意挂成只读空卷 ──────────────────────────────────
+# 镜像里 WB_AUTH_DIR / WB_UPSTREAM_CONFIG / WB_UPSTREAM_DIR 的默认值都指向
+# /opt/workbuddy2api/*。两个事实叠起来会产生一个陷阱：
+#   · 这个目录在镜像里**本来就存在**（Dockerfile 里 mkdir 过）；
+#   · 面板落盘账号时会自己建子目录 —— server/services/tencent.py 的
+#     write_auth_file 里就是 `base.mkdir(parents=True, exist_ok=True)`。
+# 所以「什么都不挂」并不安全：点「添加账号」会把凭证**成功写进面板容器自己那层
+# 临时文件系统** —— 上游读不到（账号显示「未加载」），Pod 一重启就没了。
+# 这不是报错，是**看起来成功了**，比报错更坏。
+# 因此下面挂一个**只读空卷**挡住它：任何写入立刻拿到 Read-only file system，
+# 问题当场暴露。已实测：只读挂载不影响启动与查询（/api/healthz、/api/accounts
+# 都正常），而写入确实会失败。
+# 千万别换成可写的 emptyDir 或 hostPath —— 那正好把「静默写进死目录」放回来。
 #
 # ── 对外暴露 ──────────────────────────────────────────────────────
 # 下游客户端连的是**面板**的 /v1（密钥、配额、IP 白名单、用量日志都在面板侧），
@@ -215,10 +221,18 @@ spec:
             # 面板自己的数据：SQLite + users.json。必须持久化。
             - name: manager-data
               mountPath: /app/data
+            # 只读空卷挡住「静默写入」—— 理由见文件开头。挂只读是刻意的：
+            # 面板添加账号时会自己 mkdir 出 auths/ 并写进去，而这里并没有上游目录，
+            # 写下去只会落进容器自己那层临时文件系统（上游读不到、重启即丢）。
+            - name: upstream-path-guard
+              mountPath: /opt/workbuddy2api
+              readOnly: true
       volumes:
         - name: manager-data
           persistentVolumeClaim:
             claimName: workbuddy-manager-data
+        - name: upstream-path-guard
+          emptyDir: {}
 
 ---
 apiVersion: v1

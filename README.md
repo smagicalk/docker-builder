@@ -280,16 +280,17 @@ kubectl -n workbuddy port-forward svc/workbuddy-manager 7864:7864
 
 | 面板功能 | 拆开后 | 替代做法 |
 |---|---|---|
-| 扫码「添加账号」 | ✗ 按钮报错 | 上游容器内执行 `./login.sh --realm=cn` |
-| 「设置」页保存 | ✗ 报错并锁定保存 | `kubectl cp` 改 `config.json` 再重启上游 |
+| 扫码「添加账号」 | ✗ **看似成功**：会写进面板容器自己的目录，上游读不到（显示「未加载」）、重启即丢 —— 清单里已用只读空卷把它变成硬报错 | 上游容器内执行 `./login.sh --realm=cn` |
+| 「设置」页保存 | ✗ 读不到 `config.json` → 报错并锁定保存 | `kubectl cp` 改 `config.json` 再重启上游 |
 | 重启上游 / 读上游日志 / 一键更新 / 端口收敛 | ✗ 降级提示（k8s 里没有 docker 守护进程） | `kubectl -n workbuddy logs`、`rollout restart` |
 | 仪表盘、账号列表、密钥、日志、用量、IP 管控、模型中心、测试台 | ✓ 照常 | 只走 HTTP，不受影响 |
 
-> 那两处报错是**预期**的：面板的设计是「读失败就明确报原因并锁定保存」，
-> 不会用空配置覆盖真实文件。**别**用 emptyDir 把路径造出来骗过它 —— 那会让保存
-> 看起来成功了、上游却读不到。有 RWX 存储（NFS / CephFS / Longhorn）的话可以切回
-> 共享卷模式把那两项能力找回来，改法写在
-> [`deploy/k8s/README.md`](deploy/k8s/README.md)。
+> 「添加账号」为什么会**看似成功**：面板落盘凭证时会自己 `mkdir` 出 `auths/`
+> （`server/services/tencent.py` 的 `write_auth_file`），而镜像里 `/opt/workbuddy2api`
+> 本来就存在 —— 于是它会写进面板容器自己那层临时文件系统。清单里给该路径挂了
+> **只读空卷**，写入会立刻失败、当场暴露（**别**换成可写的 emptyDir）。
+> 有 RWX 存储（NFS / CephFS / Longhorn）的话可以切回共享卷模式把这四项能力找回来，
+> 改法写在 [`deploy/k8s/README.md`](deploy/k8s/README.md)。
 
 几处刻意的设计（理由都写在清单注释里）：
 
