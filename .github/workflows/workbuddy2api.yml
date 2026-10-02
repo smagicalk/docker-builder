@@ -1,0 +1,339 @@
+# 上游 workbuddy2api 镜像：定时检查 Release 附件有没有更新，变了就自动构建并推送。
+#
+# 背景：官方 workbuddy-manager 只发布「面板」的镜像，**上游 workbuddy2api 没有官方镜像**
+# （它的源码仓库已不可访问，源码只随 workbuddy-manager 的 Release 附件分发）。于是
+# 「怎么拿到一份上游镜像」就成了每次部署都要现 build 的事。本仓库只做一件事：把那个
+# Release 附件轮询出变化，自动打包成镜像推到你自己的镜像仓库。
+#
+# 本仓库**不含上游源码**，源码只在构建时从 Release 附件现取。
+#
+# ── 触发 ────────────────────────────────────────────────────────
+#   · schedule         每 6 小时查一次（改下面 cron 即可换频率）
+#   · workflow_dispatch 手动触发，可选 force 忽略「已是最新」
+#   · push（仅默认分支且仅本文件变化） 首次推送本仓库后立刻出一份镜像，不必等定时
+#
+# ── 怎么判断「更新了」──────────────────────────────────────────
+# 用附件的 SHA-256 当版本号（GitHub Release API 直接给）。推上去的镜像带一个
+# sha256-<前12位> 标签；检查时先问镜像仓库「这个标签在不在」——
+# 在 = 源码没变 = 直接跳过构建，不在 = 变了（或第一次跑）= 构建。
+# 这样不需要在仓库里存任何状态文件，重复跑也安全。
+#
+# 查询本身失败时（网络抖动、权限不足）也算「需要构建」：宁可多构建一次，
+# 也不会因为一次查询失败的假阴性而漏掉真更新。重建的内容与已推的完全一致，
+# 除了多花几分钟构建时间没有别的代价。
+#
+# ── 需要的东西 ─────────────────────────────────────────────────
+#   · GHCR：用内置 GITHUB_TOKEN，无需配置。**首次推送后到包的设置页把可见性改成
+#     Public**，否则别人 docker pull 会 401（Actions 自己读写不受影响）。
+#   · Docker Hub（可选）：配两个 Secret 才启用，不配则自动跳过、不报错：
+#       DOCKERHUB_USERNAME / DOCKERHUB_TOKEN（Access Token，权限 Read & Write）
+#   · 可选仓库变量 IMAGE_NAME：改镜像名（默认 workbuddy2api）
+#
+# ── 它不做什么 ─────────────────────────────────────────────────
+# 不碰 workbuddy-manager 面板本身、不创建 Release、不签名。只产出一个上游镜像。
+
+name: workbuddy2api
+
+on:
+  schedule:
+    # 每 6 小时一次（UTC）。cron 用非整点分钟，避开整点的排队高峰。
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '忽略「已是最新」判断，强制重新构建推送'
+        type: boolean
+        default: false
+  push:
+    # 首次把本仓库推上去时立刻构建一份，省得等定时。只认本文件的变化，
+    # 之后改 README / compose 不会白白跑一次多架构构建。
+    paths:
+      - '.github/workflows/workbuddy2api.yml'
+
+# 两次运行不互相打断：同时推同一批标签时 latest 指向谁不好说。（排队，不取消。）
+concurrency:
+  group: workbuddy2api
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  # 推镜像到 GHCR 必须显式声明；只有 contents 会被拒。
+  packages: write
+
+env:
+  # 上游源码附件的坐标（workbuddy-manager 的 upstream-src Release）
+  UPSTREAM_REPO: ithtelab/workbuddy-manager
+  UPSTREAM_TAG: upstream-src
+  UPSTREAM_ASSET: workbuddy2api-src.tar.gz
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # push 触发时只在默认分支上真跑，避免 feature 分支把 latest 覆盖掉。
+    if: github.event_name != 'push' || github.ref_name == github.event.repository.default_branch
+    steps:
+      - name: 解析镜像名
+        id: image
+        env:
+          # 仓库所有者自动带上（谁 fork 就推谁名下）；未设 IMAGE_NAME 时用默认名。
+          IMAGE_NAME: ${{ vars.IMAGE_NAME || 'workbuddy2api' }}
+          HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          set -euo pipefail
+          # GHCR 要求镜像名全小写，用户名可能含大写字母，所以强制转小写。
+          GHCR="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${IMAGE_NAME,,}"
+          echo "ghcr=${GHCR}" >> "$GITHUB_OUTPUT"
+          if [ -n "${HUB_USER}" ]; then
+            echo "hub=docker.io/${HUB_USER,,}/${IMAGE_NAME,,}" >> "$GITHUB_OUTPUT"
+          else
+            echo "hub=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 查上游 Release 附件
+        id: upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          API="https://api.github.com/repos/${UPSTREAM_REPO}/releases/tags/${UPSTREAM_TAG}"
+
+          # 优先带 token 请求（额度高）；万一 token 对别的仓库不适用就退回匿名请求。
+          fetch() {
+            local auth=(-H "Accept: application/vnd.github+json")
+            if [ -n "${GH_TOKEN:-}" ]; then
+              curl -fsSL "${auth[@]}" -H "Authorization: Bearer ${GH_TOKEN}" "$API" && return 0
+            fi
+            curl -fsSL "${auth[@]}" "$API"
+          }
+
+          if ! JSON="$(fetch)"; then
+            echo "::error::拉取 Release 信息失败：${API}"
+            exit 1
+          fi
+
+          pick() { printf '%s' "$JSON" | jq -r --arg n "$UPSTREAM_ASSET" "$1"; }
+
+          URL="$(pick '.assets[] | select(.name==$n) | .browser_download_url')"
+          if [ -z "$URL" ] || [ "$URL" = "null" ]; then
+            echo "::error::Release ${UPSTREAM_TAG} 里找不到附件 ${UPSTREAM_ASSET}（上游改了文件名？）"
+            printf '%s' "$JSON" | jq -r '.assets[].name' | sed 's/^/  实际附件：/'
+            exit 1
+          fi
+
+          # digest 形如 sha256:xxxx；老 Release 可能没有这个字段，留空待下载后自算。
+          DIGEST="$(pick '.assets[] | select(.name==$n) | (.digest // "")')"
+          DIGEST="${DIGEST#sha256:}"
+          UPDATED="$(pick '.assets[] | select(.name==$n) | .updated_at')"
+
+          echo "url=${URL}" >> "$GITHUB_OUTPUT"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "updated=${UPDATED}" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u -d "$UPDATED" +%Y%m%d)" >> "$GITHUB_OUTPUT"
+
+          echo "附件地址：$URL"
+          echo "附件摘要：${DIGEST:-（API 未提供，下载后自算）}"
+          echo "附件更新时间：$UPDATED"
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 判断镜像是否已是最新
+        id: check
+        env:
+          IMAGE: ${{ steps.image.outputs.ghcr }}
+          DIGEST: ${{ steps.upstream.outputs.digest }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          if [ "${FORCE}" = "true" ]; then
+            echo "手动要求强制重建"
+            echo "need_build=1" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -z "${DIGEST}" ]; then
+            # 拿不到摘要就没法比对，只能构建（构建后再按自算摘要打标签）
+            echo "need_build=1" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          TAG="sha256-${DIGEST:0:12}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          if docker buildx imagetools inspect "${IMAGE}:${TAG}" >/dev/null 2>&1; then
+            echo "源码未变化：${IMAGE}:${TAG} 已存在，跳过构建"
+            echo "need_build=0" >> "$GITHUB_OUTPUT"
+          else
+            echo "检测到新源码（${IMAGE}:${TAG} 尚不存在），开始构建"
+            echo "need_build=1" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 下载上游源码并校验
+        if: steps.check.outputs.need_build == '1'
+        id: fetch
+        env:
+          URL: ${{ steps.upstream.outputs.url }}
+          EXPECTED: ${{ steps.upstream.outputs.digest }}
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 --retry-delay 5 -o upstream-src.tar.gz "$URL"
+
+          # 先按下载内容自算摘要，再与 API 给的摘要核对；不一致就拒绝构建
+          # （附件在传输途中被换掉、或上游替换了附件而 API 缓存没跟上）。
+          ACTUAL="$(sha256sum upstream-src.tar.gz | cut -d' ' -f1)"
+          if [ -n "${EXPECTED}" ] && [ "${ACTUAL}" != "${EXPECTED}" ]; then
+            echo "::error::附件摘要不一致：期望 ${EXPECTED}，实际 ${ACTUAL}"
+            exit 1
+          fi
+          echo "digest=${ACTUAL}" >> "$GITHUB_OUTPUT"
+
+          mkdir -p src
+          # 附件里有一个顶层目录，剥掉它，直接把源码摊到 src/（与上游 / 面板的
+          # 安装脚本同一套处理方式）。万一没有顶层目录，剥完会缺文件，再解一次。
+          tar -xzf upstream-src.tar.gz -C src --strip-components=1
+          if [ ! -f src/Dockerfile ]; then
+            echo "剥离顶层目录后未见 Dockerfile，改为原样解压"
+            rm -rf src && mkdir -p src
+            tar -xzf upstream-src.tar.gz -C src
+          fi
+
+          [ -f src/Dockerfile ] || { echo "::error::源码里没有 Dockerfile，无法构建"; exit 1; }
+          echo "源码大小：$(du -sh src | cut -f1)"
+
+      - name: 解析标签
+        if: steps.check.outputs.need_build == '1'
+        id: tags
+        env:
+          GHCR: ${{ steps.image.outputs.ghcr }}
+          HUB: ${{ steps.image.outputs.hub }}
+          DIGEST: ${{ steps.fetch.outputs.digest }}
+          DATE: ${{ steps.upstream.outputs.date }}
+        run: |
+          set -euo pipefail
+          TAGS="$(printf '%s\n' \
+            "${GHCR}:latest" \
+            "${GHCR}:packed-${DATE}" \
+            "${GHCR}:sha256-${DIGEST:0:12}")"
+          if [ -n "${HUB}" ]; then
+            TAGS="${TAGS}"$'\n'"${HUB}:latest"
+            TAGS="${TAGS}"$'\n'"${HUB}:packed-${DATE}"
+            TAGS="${TAGS}"$'\n'"${HUB}:sha256-${DIGEST:0:12}"
+          fi
+          {
+            echo "tags<<__TAGS__"
+            printf '%s\n' "$TAGS"
+            echo "__TAGS__"
+          } >> "$GITHUB_OUTPUT"
+          echo "本次将推送："
+          printf '%s\n' "$TAGS" | sed 's/^/  /'
+
+      - name: 登出前的 Docker Hub 凭据检查
+        if: steps.check.outputs.need_build == '1'
+        id: hub
+        env:
+          HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          HUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -n "$HUB_USER" ] && [ -n "$HUB_TOKEN" ]; then
+            echo "enabled=1" >> "$GITHUB_OUTPUT"
+            echo "Docker Hub 凭据已配置，将同时推送"
+          else
+            echo "enabled=0" >> "$GITHUB_OUTPUT"
+            echo "未配置 Docker Hub 凭据，本次只推 GHCR（这是正常的）"
+          fi
+
+      - name: 设置 QEMU
+        if: steps.check.outputs.need_build == '1'
+        # amd64 的机器上构建 arm64 层需要它（模拟出 arm64 执行环境）
+        uses: docker/setup-qemu-action@v3
+
+      - name: 设置 Buildx
+        if: steps.check.outputs.need_build == '1'
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 Docker Hub
+        if: steps.check.outputs.need_build == '1' && steps.hub.outputs.enabled == '1'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: 构建并推送（amd64 + arm64）
+        if: steps.check.outputs.need_build == '1'
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ./src
+          # 上游自带的 Dockerfile；镜像里含 wb2api / login / signin / credit /
+          # trial / activity 六个二进制与 login.sh 等脚本，运行身份 uid 10001。
+          file: ./src/Dockerfile
+          # 两个架构合并成一个 manifest list，本地镜像库放不下它，
+          # 所以必须直接推送到仓库（不能只构建不推）。
+          platforms: linux/amd64,linux/arm64
+          push: true
+          labels: |
+            org.opencontainers.image.title=workbuddy2api
+            org.opencontainers.image.description=CodeBuddy 账号池 OpenAI 兼容网关（上游源码打包，非官方镜像）
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.authors=上游作者 Sliverkiss（MIT），本镜像由 ${{ github.repository_owner }} 自动构建
+            org.workbuddy.upstream.repo=${{ env.UPSTREAM_REPO }}
+            org.workbuddy.upstream.tag=${{ env.UPSTREAM_TAG }}
+            org.workbuddy.upstream.asset=${{ env.UPSTREAM_ASSET }}
+            org.workbuddy.upstream.digest=sha256:${{ steps.fetch.outputs.digest }}
+            org.workbuddy.upstream.packed-date=${{ steps.upstream.outputs.date }}
+          tags: ${{ steps.tags.outputs.tags }}
+          # 关掉这个证明：它会在 manifest list 里塞进 attestation 条目，某些旧版
+          # Docker 拉取时报 unknown/unknown platform。
+          provenance: false
+          # 复用上一次的层缓存：Go 依赖那几层没变就不用重下。
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 输出结果
+        if: steps.check.outputs.need_build == '1'
+        env:
+          GHCR: ${{ steps.image.outputs.ghcr }}
+          HUB: ${{ steps.image.outputs.hub }}
+          DIGEST: ${{ steps.fetch.outputs.digest }}
+          DATE: ${{ steps.upstream.outputs.date }}
+        run: |
+          {
+            echo "## 上游镜像已推送"
+            echo ""
+            echo "拉取（可直接复制）："
+            echo ""
+            echo '```bash'
+            echo "docker pull ${GHCR}:latest"
+            echo '```'
+            echo ""
+            echo "标签："
+            echo ""
+            echo '```'
+            echo "${GHCR}:latest            # 最新一份"
+            echo "${GHCR}:packed-${DATE}    # 按上游附件打包日期"
+            echo "${GHCR}:sha256-${DIGEST:0:12}    # 内容寻址，可核对拉到的是哪一份"
+            if [ -n "${HUB}" ]; then
+              echo "${HUB}:latest"
+            fi
+            echo '```'
+            echo ""
+            echo "平台：linux/amd64, linux/arm64（拉取时按机器架构自动选择）"
+            echo ""
+            echo "上游附件摘要：\`sha256:${DIGEST}\`"
+            echo ""
+            echo "> 首次推送后请到包的设置页把可见性改成 **Public**，否则别人 pull 会 401。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 无变化时的小结
+        if: steps.check.outputs.need_build != '1'
+        run: |
+          {
+            echo "## 上游源码未变化，已跳过构建"
+            echo ""
+            echo "当前镜像已对应上游附件 \`sha256:${{ steps.upstream.outputs.digest }}\`。"
+            echo ""
+            echo "想强制重建：Actions → workbuddy2api → Run workflow，勾上 force。"
+          } >> "$GITHUB_STEP_SUMMARY"

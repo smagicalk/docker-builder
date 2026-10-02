@@ -1,0 +1,36 @@
+# 用「预构建镜像」跑上游 workbuddy2api（对应仓库 README 的「拉下来怎么跑」）。
+#
+# 与上游自带那份 docker-compose.yml 的差别只有一处：把 build: . 换成了 image:，
+# 也就是不再本地编译，直接用 CI 打好的镜像。其余（端口、卷、运行身份、配置文件
+# 只读挂载）都保持上游原样，行为一致。
+#
+#   1) 目录里准备好（上游要求的三样，缺一不可）：
+#        config.json   上游配置，含 api_key。首次可从上游的 config.example.json 复制
+#        auths/        账号授权文件
+#        data/         账号池状态 state.json
+#   2) chown -R 10001:10001 auths data   （容器内以 uid 10001 运行，跨 uid 读不到账号）
+#   3) docker compose up -d
+#   4) curl -s http://127.0.0.1:7863/healthz
+
+services:
+  workbuddy2api:
+    # 预构建镜像（多架构：linux/amd64 + linux/arm64，拉取时自动选）
+    # fork 了本仓库的话，把 smagicalk 换成你自己的用户名。
+    image: ghcr.io/smagicalk/workbuddy2api:latest
+    # 想锁定到某一份具体构建，用内容寻址标签（对应上游附件的 SHA-256 前 12 位）：
+    #   image: ghcr.io/smagicalk/workbuddy2api:sha256-6d3582fcedbb
+    container_name: workbuddy2api
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Shanghai
+    ports:
+      # 默认只绑本机：上游虽然要 api_key 才可用，但少一层暴露少一类风险。
+      # 面板跑在容器里时要连 host.docker.internal:7863（Linux 上容器访问宿主回环通常不通），
+      # 那种情况建议让两个容器进同一个 Docker 网络、用服务名互连，而不是放开这里。
+      - "127.0.0.1:7863:7863"
+    volumes:
+      # auths 凭证卷：扫码登录在宿主机落盘 workbuddy-<uid>.json（0600），容器网关以
+      # app(uid 10001) 读 + 回写（refresh / realm backfill 走 tmp+rename，需目录写权限）。
+      - ./auths:/app/auths
+      - ./data:/app/data
+      - ./config.json:/app/config.json:ro
