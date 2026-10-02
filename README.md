@@ -125,24 +125,154 @@ gh workflow run workbuddy2api.yml -f force=true    # 强制重新构建
 
 ---
 
-## 拉下来怎么跑
+## 怎么跑起来（Docker）
 
-上游自带的 `docker-compose.yml` 是**本地构建**的（`build: .`）。要用预构建镜像，
-把 compose 换成仓库根目录的 [`docker-compose.yml`](docker-compose.yml)（只有 `image:`，
-没有 `build:`），或直接把那两个字段替换掉。
+上游自带的 `docker-compose.yml` 是**本地构建**的（`build: .`）。要用这份预构建镜像，
+就把 compose 换成仓库根目录的 [`docker-compose.yml`](docker-compose.yml)（只有 `image:`、
+没有 `build:`），或把那两个字段替换掉。
+
+### 1. 准备三样东西
+
+| 东西 | 作用 | 注意 |
+|---|---|---|
+| `config.json` | 上游配置 | **至少设 `api_key`** |
+| `auths/` | 账号凭证 | **丢了要重新扫码** |
+| `data/` | 账号池状态（`state.json` + 模型账本） | 丢了不致命，但冷却状态与便宜号账本要重新学 |
+
+最小可用的 `config.json` —— **缺的字段全走上游默认值**（包括那套 9/21 点签到、
+22 点保活的默认定时任务），所以写这四个键就能跑：
+
+```json
+{
+  "listen": ":7863",
+  "api_key": "把 `openssl rand -hex 32` 的结果贴这里",
+  "auth_dir": "./auths",
+  "state_file": "./data/state.json"
+}
+```
+
+`api_key` **留空 = 完全不鉴权**，公网部署等于把账号池敞开。想要带全部字段的带注释基线，
+从 Release 附件里取一份 `config.example.json`（注意示例里的 `test_key` 只是占位符）：
 
 ```bash
-# 目录里要有：config.json（含 api_key）、auths/、data/
-docker compose up -d
-curl -s http://127.0.0.1:7863/healthz
+curl -fsSL https://github.com/ithtelab/workbuddy-manager/releases/download/upstream-src/workbuddy2api-src.tar.gz \
+  | tar xz --strip-components=1 --wildcards '*/config.example.json'
 ```
-（`healthy` / `total` 就是账号数；**账号池为空时 `/healthz` 返回 503、`docker ps` 会显示 unhealthy
-—— 这是上游的设计，加进第一个账号后就变 200，不是镜像坏了。**）
 
-> 想让 workbuddy-manager 面板也用这份镜像：面板的 `deploy/install.sh` 会对上游目录跑
-> `docker compose up -d --build`。把上游目录里的 compose 改成只有 `image:` 的版本即可
-> （`--build` 对没有 `build:` 段的服务是空操作，会直接用已有/已拉取的镜像）。
-> 上游的 `config.json`、`auths/`、`data/` 照旧保留，不受影响。
+### 2. 把两个目录的属主交给 10001
+
+容器以 `app(uid 10001)` 运行。目录属主不对的话，账号数会一直是 0 而且**不报错** ——
+这是最容易踩的一步：
+
+```bash
+chown -R 10001:10001 auths data
+```
+
+### 3. 起服务
+
+```bash
+docker compose up -d
+docker compose logs -f      # 出现 "listening on :7863 (api_key=true)" 就是好了
+```
+
+> 日志里那个 `api_key=true` 就是**鉴权状态**：显示 `false` 说明你没设密钥、
+> 接口对任何人开放。
+
+不用 compose 的话，等价的一条命令：
+
+```bash
+docker run -d --name workbuddy2api --restart unless-stopped \
+  -e TZ=Asia/Shanghai \
+  -p 127.0.0.1:7863:7863 \
+  -v "$PWD/auths:/app/auths" \
+  -v "$PWD/data:/app/data" \
+  -v "$PWD/config.json:/app/config.json:ro" \
+  ghcr.io/smagicalk/workbuddy2api:latest
+```
+
+> 固定 `TZ=Asia/Shanghai` 是必要的：定时任务里「几点执行」按进程本地时区判定，
+> 不设就按容器默认的 UTC 走，配置里的 `9 / 21` 点会变成北京时间 17 点 / 次日 5 点。
+
+### 4. 加账号（扫码）
+
+**要在容器内登录**：第 2 步把 `auths/` 交给 10001 之后，宿主机侧跑 `./login.sh` 会被
+脚本自带的可写性预检直接拦下（不会白走一遍授权）。容器内的 `app` 自己落盘，属主天然正确：
+
+```bash
+docker compose exec -it workbuddy2api ./login.sh --realm=cn
+# 国际版：--realm=global；不带参数且 stdin 是 tty 时会交互式问你要哪个域
+```
+
+按提示在浏览器里完成授权。加完**不用重启** —— 网关每 5 秒扫一次 `auths/`，新凭证自动进池
+（日志会打 `新增账号自动加载，无需重启`）。
+
+### 5. 验证
+
+```bash
+curl -s http://127.0.0.1:7863/healthz          # 无需鉴权
+# {"healthy":1,"realm_servable":{"cn":true,"global":true},"service":"workbuddy2api","total":1}
+
+K=<你的 api_key>
+curl -s -H "Authorization: Bearer $K" http://127.0.0.1:7863/status
+curl -s -H "Authorization: Bearer $K" http://127.0.0.1:7863/v1/models
+
+curl -s http://127.0.0.1:7863/v1/chat/completions \
+  -H "Authorization: Bearer $K" -H 'Content-Type: application/json' \
+  -d '{"model":"glm-5.2","messages":[{"role":"user","content":"你好"}]}'
+```
+
+`/healthz` 里的 `healthy` / `total` 就是账号数。**账号池为空时它返回 503、`docker ps`
+会显示 unhealthy** —— 这是上游的设计（用 `Pool.ServableNow()` 判「能不能受理请求」），
+加进第一个账号就变 200，不是镜像坏了。
+
+### 6. 更新镜像
+
+```bash
+docker compose pull && docker compose up -d
+```
+
+上游源码换新后本仓库会自动重建镜像（见上面「两种触发方式」），你这边 `pull` 一次即可；
+`auths/` 与 `data/` 在卷里，升级不碰它们。
+
+### 想让 workbuddy-manager 面板管它
+
+面板的 `deploy/install.sh` 会对上游目录跑 `docker compose up -d --build`。把上游目录里的
+compose 换成只有 `image:` 的版本即可（`--build` 对没有 `build:` 段的服务是空操作，
+会直接用已拉取的镜像），`config.json` / `auths/` / `data/` 照旧保留。
+
+---
+
+## 在 Kubernetes 里跑
+
+清单是一个文件：[`deploy/k8s.yaml`](deploy/k8s.yaml)，里面是 Secret、ConfigMap、两个 PVC、
+Deployment、Service，末尾还带一份注释掉的 Ingress 示例。已用 `kubeconform -strict`
+校验过（7 个资源全 valid）。
+
+```bash
+kubectl apply -f deploy/k8s.yaml
+kubectl rollout status deploy/workbuddy2api
+kubectl exec -it deploy/workbuddy2api -- ./login.sh --realm=cn   # 扫码加账号
+kubectl port-forward svc/workbuddy2api 7863:7863                 # 本机验证
+```
+
+与 Docker 部署的三处差异，都是刻意的：
+
+| 点 | 做法 | 为什么 |
+|---|---|---|
+| 副本数 | **固定 `replicas: 1`**，更新用 `strategy: Recreate` | 账号池是单进程本地状态 + 本地 `auths/`：多副本会各自把定时任务跑一遍（重复签到、重复领奖，还有 WAF 风险），并争抢同一份 `state.json`。真要扩容，先关掉 `schedule.*` 那几个开关 |
+| 卷属主 | `securityContext.fsGroup: 10001` | k8s 里不用手工 `chown`；fsGroup 会把 PVC 属主整好，等价于上面第 2 步 |
+| 探针 | 用 **TCP 探针**，不是 `/healthz` | `/healthz` 在账号池为空时返回 503：当 liveness 会让 Pod 反复重启；当 readiness 会让「还没加账号」时 Service 不转发，连扫码加账号都做不了 |
+
+`api_key` 单独走 Secret、由环境变量 `WB2A_API_KEY` 注入（上游本身支持用环境变量覆盖
+配置），所以密钥不会落到 ConfigMap 里。建议这样建，而不是把密钥写进 YAML：
+
+```bash
+kubectl create secret generic workbuddy2api-secret \
+  --from-literal=api_key="$(openssl rand -hex 32)" \
+  --dry-run=client -o yaml | kubectl apply -f -
+```
+
+镜像换新后滚动一次：`kubectl rollout restart deploy/workbuddy2api`。
 
 ---
 
