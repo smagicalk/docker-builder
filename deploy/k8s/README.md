@@ -296,6 +296,7 @@ spec:
 | 账号池突然变 0、配置回到默认基线 | Pod 被调度到了**另一台节点** —— hostPath 的数据在那台上是空的（init 于是又写了一份新基线）。给四个 PV 加 `nodeAffinity` 钉住有数据的那台，或改用 CSI 存储；见「多节点集群」一节 |
 |---|---|
 | 面板提示 `Cannot connect to the Docker daemon at unix:///var/run/docker.sock` | **预期行为**：面板镜像自带 docker CLI，但 K8s 里没有 docker socket/守护进程 —— 「重载上游 / 读上游日志 / 一键更新 / 端口收敛」都会降级成这句。用 `kubectl -n workbuddy logs`、`rollout restart`、`port-forward` 代替 |
+| 面板提示「上游配置里声明的账号目录与本站读取的不一致，管理端实际以「账号目录」为准」 | **预期现象，不是配错**：面板把 config.json 里的 `auth_dir`（官方默认就是相对路径 `./auths`）与自己的 `WB_AUTH_DIR`（默认绝对路径 `/opt/workbuddy2api/auths`）做**字面**比较（`server/services/wb2api.py` 的 `load_upstream_config`），字面不同就带上 `upstream_auth_dir` 让界面提示。两边其实是**同一块卷**：上游的 CWD 是 `/app`，`./auths` 即 `/app/auths`；面板读的 `/opt/workbuddy2api/auths` 就是那块共享的 auths 卷。**官方 Docker 部署同样会显示这句**（它也不覆盖 `WB_AUTH_DIR`），而面板行为正确 —— 它就以自己的账号目录为准 |
 | PV 一直 `Pending` / PVC 绑不上 | `claimRef.namespace` 写错（换过命名空间？），或 PV 与 PVC 的 `storageClassName` 不一致 —— 静态供给时两边必须**同时**为空字符串或同时填同一个名字 |
 | Pod `CreateContainerConfigError` | 少了 `workbuddy2api-secret`（两个容器都要它） |
 | 「设置页显示已保存，但上游行为没变」 | 忘了重启：`kubectl -n workbuddy rollout restart deploy/workbuddy`（配置只在启动时读一次） |

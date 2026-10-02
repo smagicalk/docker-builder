@@ -498,6 +498,13 @@ spec:
             - name: config
               mountPath: /opt/workbuddy2api/config.json
               subPath: config.json
+            # 面板会提示「上游配置里声明的账号目录与本站读取的不一致」—— 属**预期**现象：
+            # 面板把 config.json 里的 auth_dir（官方默认就是相对路径 "./auths"）与自己的
+            # WB_AUTH_DIR（默认绝对路径 /opt/workbuddy2api/auths）做**字面**比较
+            # （server/services/wb2api.py 的 load_upstream_config），字面不同就提示。
+            # 两者其实是同一块卷：上游 CWD 是 /app ⇒ "./auths" 就是 /app/auths（上面那块
+            # auths 卷）；面板读的 /opt/workbuddy2api/auths 也是它。官方 Docker 部署同样会
+            # 显示这句（它也不覆盖 WB_AUTH_DIR）—— 面板的实际行为是对的：以 AUTH_DIR 为准。
             # 与上游**共享**的账号目录：面板「扫码添加账号」写在这里，上游每 5 秒扫一次
             # 自动进池（不用重启）。这里是真目录，不是旧版本里那个「只读空卷」。
             - name: auths
