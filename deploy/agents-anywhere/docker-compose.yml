@@ -13,8 +13,9 @@
 #
 # ⚠️ 密码用 hex（只含 0-9a-f）：下面 DB URL 是拼字符串的，密码里出现 @ : / 会把它拆坏。
 #
-# 用**外部** PG / Redis：把下面 postgres 与 redis 两个服务删掉，并把 server 的
-#   AGENT_SERVER_DB_URL / AGENT_SERVER_REDIS_URL 换成外部地址（migrate 服务也要跟着改 URL）。
+# 用**外部** PG / Redis：把下面 postgres 与 redis 两个服务删掉，同时删掉 migrate / server 上
+#   指向它们的 depends_on（留着会直接报 `depends on undefined service postgres`），再把 migrate
+#   与 server 的 AGENT_SERVER_DB_URL / AGENT_SERVER_REDIS_URL 换成外部地址。
 #   外部 Redis 同样得是 AOF + noeviction + 持久盘；K8s 那边用的是 ExternalName 桥接，
 #   见 deploy/agents-anywhere/k8s/README.md 的「用外部 PG / Redis」。
 
