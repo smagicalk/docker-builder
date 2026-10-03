@@ -19,6 +19,9 @@
 #   3. 首次是空库时**必须单 worker**（默认就是 1）：初始 setup token 只存在于那个进程里、
 #      打印在日志中。想开多 worker / 多副本，先完成引导，再按上游 8cpu 那份 profile 加
 #      `AGENT_SERVER_WORKERS` 并把 `AGENT_SERVER_TIMELINE_SINGLE_INSTANCE` 设为 false。
+#   4. PG / Redis 按**外部服务**用：主机名 postgres / redis 由 10-postgres.yaml、20-redis.yaml
+#      里那两个 ExternalName Service 指到外面（填你的域名）。因此这里**不等待**它们就绪 ——
+#      连不上时表现为 migrate init 容器失败（k8s 自动退避重试）与 readiness 503，liveness 不受影响。
 
 ---
 # /data：上传与附件（AGENT_SERVER_FILES_BACKEND=local）。丢了等于附件没了，库还在。
@@ -79,27 +82,11 @@ spec:
         app.kubernetes.io/part-of: agents-anywhere
     spec:
       initContainers:
-        # ① 等 Postgres 能连（对应 compose 的 depends_on: service_healthy）。
-        #    用镜像自带的 python3 做 TCP 探测，不依赖 psql/nc。
-        - name: wait-for-postgres
-          image: ghcr.io/smagicalk/agents-anywhere:latest
-          imagePullPolicy: Always
-          command: ["/bin/sh", "-c"]
-          args:
-            - |
-              set -eu
-              i=0
-              until python3 -c 'import socket; s=socket.socket(); s.settimeout(2); s.connect(("postgres", 5432)); s.close()' 2>/dev/null; do
-                i=$((i + 1))
-                if [ "$i" -gt 60 ]; then
-                  echo "[init] 等 Postgres 超过 120 秒，放弃"
-                  exit 1
-                fi
-                echo "[init] 等 Postgres 就绪（第 ${i} 次）"
-                sleep 2
-              done
-              echo "[init] Postgres 可连接"
-        # ② 跑迁移（命令与上游 compose 的 migrate 服务逐字一致）。
+        # 注意：这里**没有**等 Postgres / Redis 的 init 容器 —— 它俩是**外部服务**
+        # （主机名 postgres / redis 由 10-postgres.yaml、20-redis.yaml 里那两个 ExternalName
+        # Service 指到外面）。外部库暂时连不上时：这个迁移 init 容器会失败、k8s 按退避重试
+        # （比 Pod 一直挂在 Init 上更好排查），服务起来后 readiness 才报 503、liveness 不受影响。
+        # 下面这一步照跑不误（库结构升级仍然必须）。
         - name: migrate
           image: ghcr.io/smagicalk/agents-anywhere:latest
           imagePullPolicy: Always
@@ -113,6 +100,7 @@ spec:
                   name: agents-anywhere-secret
                   key: postgres-password
             # 与下面容器同一套拼法（kubectl 会展开同容器内先定义的 $(POSTGRES_PASSWORD)）。
+            # 主机名 postgres 同上：由 10-postgres.yaml 的 ExternalName Service 指向外部库。
             - name: AGENT_SERVER_DB_URL
               value: postgresql+asyncpg://agents_anywhere:$(POSTGRES_PASSWORD)@postgres:5432/agents_anywhere
             - name: AGENT_SERVER_MIGRATION_LOCK_TIMEOUT
@@ -127,6 +115,7 @@ spec:
             - name: AGENT_SERVER_DB_BACKEND
               value: postgres
             # 密码单独取一次，再由 kubectl 展开进 URL（避免同一份密码存两处、日后漂移）。
+            # 主机名 postgres 由 10-postgres.yaml 的 ExternalName Service 指到你的外部库。
             - name: POSTGRES_PASSWORD
               valueFrom:
                 secretKeyRef:
@@ -143,6 +132,7 @@ spec:
             - name: AGENT_SERVER_DB_POOL_RECYCLE
               value: "1800"
             # ── Redis（协调 / Pub/Sub / Timeline 序号）────────────────
+            # 主机名 redis 由 20-redis.yaml 的 ExternalName Service 指到你的外部 Redis。
             - name: AGENT_SERVER_REDIS_URL
               value: redis://redis:6379/0
             - name: AGENT_SERVER_REDIS_CONNECT_TIMEOUT

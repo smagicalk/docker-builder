@@ -4,6 +4,12 @@
 # ⚠️ 别给这个容器设 `runAsNonRoot` —— 官方 postgres 镜像的入口脚本要先以 root 身份把数据目录
 #    的属主改成 postgres(999)，再降权启动；强制非 root 会让它直接起不来。Redis 同理（见 20-redis.yaml）。
 
+# ── 两种用法，按需 apply（这份文件把两者都留着）────────────────────
+#   · 用**外部** PostgreSQL（当前方案）：只 apply 本文件**最后那个 Service**（ExternalName，
+#     把服务名 postgres 指到外部主机）。前面的 PV/PVC/Deployment 是自建时才用 —— 别一起 apply，
+#     否则会白起一个 Postgres 容器，它还会在自己的空目录里 initdb 出一个**空库**。
+#   · 自建（这个 Deployment）：apply 整个文件。
+
 ---
 # 数据盘。hostPath 静态供给（你集群没有默认 StorageClass），Retain：删 PVC 不删数据。
 # 多节点集群必须给 PV 钉节点或换 CSI，否则 Pod 落到别的节点会看到「空库」——
@@ -53,7 +59,9 @@ metadata:
     app.kubernetes.io/name: postgres
     app.kubernetes.io/part-of: agents-anywhere
 spec:
-  replicas: 1
+  # 外部依赖模式（当前用法）：默认 0 副本 —— 这个 Postgres 不跑，apply 整个目录也不会白起
+  # 容器。要改成自建：这里改回 1，并把本文件最后那个 Service 从 ExternalName 换回 ClusterIP。
+  replicas: 0
   strategy:
     # 单实例数据库：不允许新旧两个 Postgres 同时挂同一份数据目录。
     type: Recreate
@@ -89,22 +97,6 @@ spec:
           ports:
             - name: pg
               containerPort: 5432
-          # 探针用上游 compose 的 healthcheck 同款命令。
-          # 首次 initdb 可能要十几秒，所以 startupProbe 放宽（2s × 30 = 60s）。
-          startupProbe:
-            exec:
-              command: ["sh", "-c", "pg_isready -U agents_anywhere -d agents_anywhere"]
-            periodSeconds: 2
-            failureThreshold: 30
-          readinessProbe:
-            exec:
-              command: ["sh", "-c", "pg_isready -U agents_anywhere -d agents_anywhere"]
-            periodSeconds: 10
-          livenessProbe:
-            exec:
-              command: ["sh", "-c", "pg_isready -U agents_anywhere -d agents_anywhere"]
-            periodSeconds: 20
-            failureThreshold: 3
           resources:
             requests:
               cpu: 100m
@@ -121,7 +113,16 @@ spec:
             claimName: agents-anywhere-postgres
 
 ---
-# 只集群内可达：server 用服务名 postgres:5432 连它，不需要对外暴露。
+# 桥接：把服务名 postgres 指到**外部** PostgreSQL。K8s 的 ExternalName 就是一条 DNS CNAME，
+# 不做代理、也不做端口转换 —— 所以 30-server.yaml 里 AGENT_SERVER_DB_URL 的 `@postgres:5432`
+# 不用改，原样就能连上外部库。
+# ⚠️ 三个要知道的点：
+#   1. externalName 只能填**域名**（CNAME 语义），填 IP 不生效。你的外部库只有 IP 的话，
+#      不要用 ExternalName，直接在 30-server.yaml 的 AGENT_SERVER_DB_URL 里写 IP:端口。
+#   2. 不做端口转换：客户端拨的就是 URL 里的 5432，所以外部库必须监听 5432；
+#      不是的话改 URL 里的端口（这里改没用）。
+#   3. 集群节点要能解析并**直连**这个域名；跨公网的话请自己加密（TLS 端点 / 隧道 / WireGuard），
+#      数据库流量默认是明文。
 apiVersion: v1
 kind: Service
 metadata:
@@ -131,10 +132,8 @@ metadata:
     app.kubernetes.io/name: postgres
     app.kubernetes.io/part-of: agents-anywhere
 spec:
-  type: ClusterIP
-  selector:
-    app.kubernetes.io/name: postgres
+  type: ExternalName
+  externalName: pg.example.com        # ← 换成你的外部 PostgreSQL 主机名
   ports:
     - name: pg
       port: 5432
-      targetPort: pg

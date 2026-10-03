@@ -23,6 +23,11 @@
 两个外部依赖都不是可选的：上游文档写明 Redis 那些 key **没有 TTL**，所以用 AOF + 持久卷 +
 `noeviction`；而 Postgres 才是最终落盘的地方。
 
+**但它们不必跟服务端住在一起**：K8s 清单默认就是「外部 PG / Redis」（见
+[`k8s/README.md`](k8s/README.md) 的「用外部 PG / Redis」一节）；Docker Compose 想接外部库，
+把 `postgres` / `redis` 两个服务删掉、`AGENT_SERVER_DB_URL` / `AGENT_SERVER_REDIS_URL` 改成
+外部地址即可（外部 Redis 同样得是 AOF + `noeviction` + 持久盘）。
+
 ## 跑法一：Docker
 
 ```bash
@@ -38,7 +43,9 @@ Web 控制台：`http://127.0.0.1:5174`。
 
 ## 跑法二：Kubernetes
 
-见 [`k8s/README.md`](k8s/README.md)（含初始化引导、升级时的停机窗口、扩 worker 的前提）。
+见 [`k8s/README.md`](k8s/README.md) —— 那份清单就是按「Postgres / Redis 用**外部服务**」交付的
+（`10-postgres.yaml` / `20-redis.yaml` 里的 `ExternalName` 把服务名 `postgres` / `redis` 指过去，
+服务端清单一行不用改）；里面还有初始化引导、升级时的停机窗口、扩 worker 的前提、常见坑。
 
 ## 三个容易踩的点（上游文档明确写的）
 

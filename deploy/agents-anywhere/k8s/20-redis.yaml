@@ -7,6 +7,12 @@
 #
 # 也别设 runAsNonRoot：官方 redis 镜像的入口脚本同样要先 root 改 /data 属主再降权。
 
+# ── 两种用法，按需 apply（这份文件把两者都留着）────────────────────
+#   · 用**外部** Redis（当前方案）：只 apply 本文件**最后那个 Service**（ExternalName，
+#     把服务名 redis 指到外部主机）。前面的 PV/PVC/Deployment 是自建时才用 —— 别一起 apply，
+#     否则会白起一个 Redis 容器（它的 AOF 会另起一份，谁在用谁都说不清）。
+#   · 自建（这个 Deployment）：apply 整个文件。
+
 ---
 apiVersion: v1
 kind: PersistentVolume
@@ -51,7 +57,9 @@ metadata:
     app.kubernetes.io/name: redis
     app.kubernetes.io/part-of: agents-anywhere
 spec:
-  replicas: 1
+  # 外部依赖模式（当前用法）：默认 0 副本 —— 这个 Redis 不跑，apply 整个目录也不会白起
+  # 容器。要改成自建：这里改回 1，并把本文件最后那个 Service 从 ExternalName 换回 ClusterIP。
+  replicas: 0
   strategy:
     type: Recreate
   selector:
@@ -83,21 +91,6 @@ spec:
           ports:
             - name: redis
               containerPort: 6379
-          # 与上游 healthcheck 同款：redis-cli ping。
-          startupProbe:
-            exec:
-              command: ["redis-cli", "ping"]
-            periodSeconds: 2
-            failureThreshold: 30
-          readinessProbe:
-            exec:
-              command: ["redis-cli", "ping"]
-            periodSeconds: 10
-          livenessProbe:
-            exec:
-              command: ["redis-cli", "ping"]
-            periodSeconds: 20
-            failureThreshold: 3
           resources:
             requests:
               cpu: 50m
@@ -115,6 +108,15 @@ spec:
             claimName: agents-anywhere-redis
 
 ---
+# 桥接：把服务名 redis 指到**外部** Redis。ExternalName 是一条 DNS CNAME，不做代理、
+# 也不做端口转换 —— 30-server.yaml 里 AGENT_SERVER_REDIS_URL 的 `redis://redis:6379/0`
+# 不用改，原样就能连上外部 Redis。
+# ⚠️ 三个要知道的点（与 10-postgres.yaml 同款）：
+#   1. externalName 只能填**域名**；只有 IP 就别用 ExternalName，直接改 30-server.yaml 的
+#      AGENT_SERVER_REDIS_URL 写 IP:端口。
+#   2. 不做端口转换：外部 Redis 必须监听 6379，否则改 URL 里的端口。
+#   3. 外部 Redis 也必须是「AOF 开着 + noeviction + 持久盘」那一套 —— 那些 key 没有 TTL，
+#      丢了就是丢数据（见本文件开头）。集群节点要能直连它；跨公网请自己加密。
 apiVersion: v1
 kind: Service
 metadata:
@@ -124,10 +126,8 @@ metadata:
     app.kubernetes.io/name: redis
     app.kubernetes.io/part-of: agents-anywhere
 spec:
-  type: ClusterIP
-  selector:
-    app.kubernetes.io/name: redis
+  type: ExternalName
+  externalName: redis.example.com     # ← 换成你的外部 Redis 主机名
   ports:
     - name: redis
       port: 6379
-      targetPort: redis

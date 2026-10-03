@@ -3,9 +3,13 @@
 # 为什么单独一个：这套服务与 WorkBuddy 那套完全无关（不同的库、不同的凭据），
 # 混在一个命名空间里只会让 RBAC、配额和「删错东西」的风险变大。
 #
-# 部署顺序：00-namespace → 建 Secret → 10-postgres → 20-redis → 30-server
+# 部署顺序（PG / Redis 用**外部服务**时，本目录就是按这个交付的）：
+#   00-namespace → 建 Secret → 10-postgres / 20-redis 里那两个 ExternalName Service → 30-server
 #   kubectl apply -f deploy/agents-anywhere/k8s/00-namespace.yaml
 #   （Secret 的创建命令见 30-server.yaml 顶部的注释）
+# 10/20 里的 Postgres / Redis Deployment 默认 **0 副本**（外部依赖模式），所以直接
+#   kubectl apply -f deploy/agents-anywhere/k8s/
+# 也不会白起容器；要改成自建：把那两处 replicas 改成 1，并把 Service 换回 ClusterIP。
 
 apiVersion: v1
 kind: Namespace
