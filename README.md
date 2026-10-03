@@ -1,16 +1,17 @@
-# workbuddy2api
+# 上游镜像自动打包
 
-给 [`ithtelab/workbuddy-manager`](https://github.com/ithtelab/workbuddy-manager) 的**上游
-`workbuddy2api`** 自动打包 Docker 镜像。
+把**没有官方镜像**的上游项目：定时检查更新 → 自动构建 → 推送 Docker 镜像。目前打了两个：
 
-官方只发布「面板」的镜像，**上游 workbuddy2api 没有官方镜像**——它的源码仓库已不可访问，
-源码只能从 workbuddy-manager 的 Release 附件
-[`upstream-src`](https://github.com/ithtelab/workbuddy-manager/releases/tag/upstream-src)
-里拿（`workbuddy2api-src.tar.gz`）。结果是每台新机器部署时都得现 build 一遍上游。
-本仓库把这件事自动化：**定时盯着那个附件，一变就自动构建并推送镜像。**
+| 镜像 | 上游 | 流水线 | 平台 |
+|---|---|---|---|
+| `ghcr.io/<owner>/workbuddy2api` | [`ithtelab/workbuddy-manager`](https://github.com/ithtelab/workbuddy-manager) 的 Release 附件 [`upstream-src`](https://github.com/ithtelab/workbuddy-manager/releases/tag/upstream-src) | [`workbuddy2api.yml`](.github/workflows/workbuddy2api.yml) | amd64 + arm64 |
+| `ghcr.io/<owner>/agents-anywhere` | [`anywhere-labs/Agents-Anywhere`](https://github.com/anywhere-labs/Agents-Anywhere) 的 GitHub Release | [`agents-anywhere.yml`](.github/workflows/agents-anywhere.yml) | amd64 |
 
-> **本仓库不含上游源码。** 源码只在构建时从 Release 附件现取，用完即弃。
-> 这里只有一份 workflow、`deploy/` 下的部署说明与 compose，和这份说明。
+> **本仓库不含任何上游源码。** 源码只在构建时按附件 / release tag 现取，用完即弃。
+> `deploy/` 下是「怎么把这些镜像跑起来」的说明（按项目分文件夹）。
+
+下面**五节**（镜像在哪 / 两种触发方式 / 它怎么工作 / 首次使用 / 配置项）讲的都是
+`workbuddy2api` 那条流水线；`agents-anywhere` 的差异见后面的[同名小节](#agents-anywhere-镜像)。
 
 ---
 
@@ -122,6 +123,35 @@ gh workflow run workbuddy2api.yml -f force=true    # 强制重新构建
 
 **手动触发 / 强制重建**：见上面「两种触发方式（自动 / 手动）」一节
 （上游换了附件却没换摘要时，用 `force` 无条件重建）。
+
+---
+
+## agents-anywhere 镜像
+
+上游 [`anywhere-labs/Agents-Anywhere`](https://github.com/anywhere-labs/Agents-Anywhere)：
+**只发 release、不发镜像**（它的 compose 是 `build: context: ..`，Quickstart 也是让你本地 build），
+所以本仓库在每个新 release 出来后，按那个 tag 构建一份。
+
+| 项 | 值 |
+|---|---|
+| 镜像 | `ghcr.io/<owner>/agents-anywhere` |
+| 流水线 | [`agents-anywhere.yml`](.github/workflows/agents-anywhere.yml) |
+| 触发 | 每 6 小时查一次**最新正式 release**（`/releases/latest`，不含 draft / prerelease）；也可手动 |
+| 判断依据 | release tag 指向的**提交**（用 `sha-<前12位>` 探测），tag 被移动过（重新发布）也能认出来 |
+| 标签 | `latest`（只给最新那份 release）、`vX.Y.Z`（对应 release）、`sha-<前12位>` |
+| 平台 | **仅 linux/amd64** —— 它的构建含 Next.js，QEMU 下模拟 arm64 会慢到不可用 |
+| 构建上下文 | release tag 的源码 tarball（整个仓库：`docker/Dockerfile` 要 `COPY web-next/` 与 `server/`） |
+
+```bash
+docker pull ghcr.io/<owner>/agents-anywhere:latest
+```
+
+**手动构建**：Actions → **agents-anywhere** → Run workflow —— 勾 `force` 忽略「已构建过」强制
+重建；填 `tag`（例如 `v2.0.0`）重建某个历史 release（这种**不会**动 `latest`）。
+
+> ⚠️ **许可**：上游仓库**没有声明 License**（GitHub API 返回 `null`）= 默认「保留所有权利」。
+> 本流水线默认把镜像推到 GHCR（公开仓库默认就是公开包）。要收紧就去
+> Packages → agents-anywhere → Package settings → Change visibility；或先给上游开个 issue 问一句。
 
 ---
 

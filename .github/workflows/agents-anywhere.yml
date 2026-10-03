@@ -1,0 +1,303 @@
+# Agents-Anywhere（anywhere-labs/Agents-Anywhere）镜像：定时看一眼有没有**新的 GitHub
+# Release**，有就按那个 release 的 tag 构建 linux/amd64 镜像并推到 GHCR。
+#
+# 与 workbuddy2api.yml 的差别（同一个骨架，判断依据不同）：
+#   · 触发依据是**上游 Release 的 tag**（不是附件摘要）—— 上游发版才构建，跟着 release 走更稳；
+#   · 只出 linux/amd64：它的构建含 Next.js（node 阶段 yarn build + python 阶段 uv sync），
+#     在 QEMU 下模拟 arm64 会慢到不可用；
+#   · 构建上下文是**整个上游仓库**（`docker/Dockerfile` 要 `COPY web-next/` 与 `server/`），
+#     所以用 release tag 的源码 tarball 解到 src/ 再构建；
+#   · 没有 QEMU 步骤（单架构不需要）。
+#
+# 触发：
+#   · schedule          每 6 小时看一次有没有新 release（有新的才构建）
+#   · workflow_dispatch 手动：可 `force` 强制重建，也可指定某个 release tag 重建
+#   · push              本文件变化时（首次推上来会立刻构建一份，省得等定时）
+#
+# ⚠️ 许可提醒（写在这里，免得以后忘）：上游仓库 **没有 LICENSE**（GitHub API 明确返回
+#    null）= 默认「保留所有权利」。本工作流默认把镜像推到 GHCR（本仓库 owner 名下的包，
+#    公开仓库默认就是公开包）。要收紧就把包设为私有：
+#      Packages → agents-anywhere → Package settings → Change visibility
+#    或先给上游开个 issue 问一句、等作者补 License。
+
+name: agents-anywhere
+
+on:
+  schedule:
+    # 每 6 小时一次（UTC）。cron 用非整点分钟，避开整点的排队高峰。
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '忽略「已是最新」判断，强制重新构建推送'
+        type: boolean
+        default: false
+      tag:
+        description: '指定上游 release tag（留空 = 最新的正式 release）'
+        type: string
+        required: false
+        default: ''
+  push:
+    # 只认本文件的变化：之后改 README 不会白白跑一次十几分钟的构建。
+    paths:
+      - '.github/workflows/agents-anywhere.yml'
+
+# 两次运行不互相打断（排队，不取消）：否则并发构建同一批标签时 latest 指向谁不好说。
+concurrency:
+  group: agents-anywhere
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  # 推镜像到 GHCR 必须显式声明；只有 contents 会被拒。
+  packages: write
+
+env:
+  UPSTREAM_REPO: anywhere-labs/Agents-Anywhere
+  UPSTREAM_DOCKERFILE: docker/Dockerfile
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # push 触发时只在默认分支上真跑，避免 feature 分支把 latest 覆盖掉。
+    if: github.event_name != 'push' || github.ref_name == github.event.repository.default_branch
+    steps:
+      - name: 解析镜像名
+        id: image
+        env:
+          # 仓库所有者自动带上（谁 fork 就推谁名下）；未设这个变量时用默认名。
+          IMAGE_NAME: ${{ vars.AGENTS_ANYWHERE_IMAGE_NAME || 'agents-anywhere' }}
+        run: |
+          set -euo pipefail
+          # GHCR 要求镜像名全小写，用户名可能含大写字母，所以强制转小写。
+          GHCR="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${IMAGE_NAME,,}"
+          echo "ghcr=${GHCR}" >> "$GITHUB_OUTPUT"
+          echo "镜像名：${GHCR}"
+
+      - name: 解析目标 Release
+        id: rel
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WANT: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          API="https://api.github.com/repos/${UPSTREAM_REPO}"
+
+          # 优先带 token 请求（额度高）；token 对别的仓库不适用时退回匿名。
+          fetch() {
+            local url="$1"
+            if [ -n "${GH_TOKEN:-}" ]; then
+              curl -fsSL -H "Accept: application/vnd.github+json" \
+                -H "Authorization: Bearer ${GH_TOKEN}" "$url" && return 0
+            fi
+            curl -fsSL -H "Accept: application/vnd.github+json" "$url"
+          }
+
+          if [ -n "${WANT:-}" ]; then
+            echo "手动指定 release tag：${WANT}"
+            REL="$(fetch "${API}/releases/tags/${WANT}")" \
+              || { echo "::error::找不到 release ${WANT}"; exit 1; }
+          else
+            # /releases/latest 只返回**最新的正式 release**（不含 draft 与 prerelease），正合需求。
+            REL="$(fetch "${API}/releases/latest")" \
+              || { echo "::error::拉取最新 release 失败（上游还没发过 release？）"; exit 1; }
+          fi
+
+          TAG="$(printf '%s' "$REL" | jq -r '.tag_name // empty')"
+          [ -n "$TAG" ] || { echo "::error::release 里没有 tag_name"; exit 1; }
+          PUBLISHED="$(printf '%s' "$REL" | jq -r '.published_at // empty')"
+          HTML="$(printf '%s' "$REL" | jq -r '.html_url // empty')"
+
+          # 解析这个 tag 指向的提交：tarball 与标签都按它取，避免 release 被改过之后对不上。
+          COMMIT="$(fetch "${API}/commits/${TAG}" | jq -r '.sha // empty')"
+          [ -n "$COMMIT" ] || { echo "::error::解析 ${TAG} 的提交失败"; exit 1; }
+
+          # 是不是最新的那份 release —— 决定要不要动 `latest` 标签。
+          LATEST_TAG="$(fetch "${API}/releases/latest" | jq -r '.tag_name // empty')"
+          if [ -n "$LATEST_TAG" ] && [ "$TAG" = "$LATEST_TAG" ]; then
+            IS_LATEST=1
+          else
+            IS_LATEST=0
+          fi
+
+          DATE="$(date -u -d "$PUBLISHED" +%Y%m%d)"
+          {
+            echo "tag=${TAG}"
+            echo "sha=${COMMIT}"
+            echo "published=${PUBLISHED}"
+            echo "date=${DATE}"
+            echo "is_latest=${IS_LATEST}"
+            echo "html=${HTML}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "目标 release：${TAG}（发布 ${PUBLISHED}）"
+          echo "对应提交：${COMMIT}"
+          echo "是否 latest：${IS_LATEST}"
+          echo "release 页面：${HTML}"
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 判断是否需要构建
+        id: check
+        env:
+          IMAGE: ${{ steps.image.outputs.ghcr }}
+          SHA: ${{ steps.rel.outputs.sha }}
+          TAG: ${{ steps.rel.outputs.tag }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          # 用「release 提交的内容寻址标签」作为已构建依据：
+          # 同一个 tag 被移动过（重新发布）时也能认出来，而只看 release tag 会误判成已构建。
+          PROBE="sha-${SHA:0:12}"
+          echo "probe_tag=${PROBE}" >> "$GITHUB_OUTPUT"
+
+          if [ "${FORCE}" = "true" ]; then
+            echo "手动要求强制重建"
+            echo "need_build=1" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if docker buildx imagetools inspect "${IMAGE}:${PROBE}" >/dev/null 2>&1; then
+            echo "上游 release 未变化：${IMAGE}:${PROBE} 已存在（对应 ${TAG}），跳过构建"
+            echo "need_build=0" >> "$GITHUB_OUTPUT"
+          else
+            echo "检测到新的 release（${TAG} → ${PROBE} 尚不存在），开始构建"
+            echo "need_build=1" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 下载该 release 的源码
+        if: steps.check.outputs.need_build == '1'
+        id: fetch
+        env:
+          TAG: ${{ steps.rel.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # 按 tag 取源码 tarball（codeload 不需要 token）。构建上下文必须是**仓库根**，
+          # 因为 docker/Dockerfile 里 COPY 的是 web-next/ 与 server/。
+          URL="https://codeload.github.com/${UPSTREAM_REPO}/tar.gz/refs/tags/${TAG}"
+          curl -fsSL --retry 3 --retry-delay 5 -o upstream-src.tgz "$URL"
+
+          mkdir -p src
+          tar -xzf upstream-src.tgz -C src --strip-components=1
+          [ -f "src/${UPSTREAM_DOCKERFILE}" ] \
+            || { echo "::error::${TAG} 的源码里没有 ${UPSTREAM_DOCKERFILE}，无法构建"; exit 1; }
+          [ -f src/web-next/package.json ] \
+            || { echo "::error::缺少 web-next/package.json（Dockerfile 要 yarn build）"; exit 1; }
+          [ -f src/server/pyproject.toml ] \
+            || { echo "::error::缺少 server/pyproject.toml（Dockerfile 要 uv sync）"; exit 1; }
+          echo "源码大小：$(du -sh src | cut -f1)"
+
+      - name: 解析标签
+        if: steps.check.outputs.need_build == '1'
+        id: tags
+        env:
+          GHCR: ${{ steps.image.outputs.ghcr }}
+          TAG: ${{ steps.rel.outputs.tag }}
+          SHA: ${{ steps.rel.outputs.sha }}
+          PROBE: ${{ steps.check.outputs.probe_tag }}
+          IS_LATEST: ${{ steps.rel.outputs.is_latest }}
+        run: |
+          set -euo pipefail
+          # 只给**最新**那份 release 动 latest，免得手动重建老版本时把 latest 指回去。
+          TAGS="$(printf '%s\n' "${GHCR}:${TAG}" "${GHCR}:${PROBE}")"
+          if [ "${IS_LATEST}" = "1" ]; then
+            TAGS="$(printf '%s\n' "${GHCR}:latest")"$'\n'"${TAGS}"
+          fi
+          {
+            echo "tags<<__TAGS__"
+            printf '%s\n' "$TAGS"
+            echo "__TAGS__"
+          } >> "$GITHUB_OUTPUT"
+          echo "本次将推送："
+          printf '%s\n' "$TAGS" | sed 's/^/  /'
+
+      - name: 设置 Buildx
+        if: steps.check.outputs.need_build == '1'
+        uses: docker/setup-buildx-action@v3
+
+      - name: 构建并推送（linux/amd64）
+        if: steps.check.outputs.need_build == '1'
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ./src
+          # 上游自带的 Dockerfile：多阶段（node 里 yarn build → python 里 uv sync），
+          # tini 当 PID 1，监听 8000，数据目录 /data。
+          file: ./src/docker/Dockerfile
+          # 单架构：Next.js 构建在 QEMU 下会慢到不可用，所以这里不做 arm64。
+          platforms: linux/amd64
+          push: true
+          labels: |
+            org.opencontainers.image.title=agents-anywhere
+            org.opencontainers.image.description=Agents-Anywhere（上游源码打包，非官方镜像；上游仓库未声明 License）
+            org.opencontainers.image.source=https://github.com/${{ env.UPSTREAM_REPO }}
+            org.opencontainers.image.revision=${{ steps.rel.outputs.sha }}
+            org.opencontainers.image.version=${{ steps.rel.outputs.tag }}
+            org.agents-anywhere.upstream.repo=${{ env.UPSTREAM_REPO }}
+            org.agents-anywhere.upstream.release=${{ steps.rel.outputs.tag }}
+            org.agents-anywhere.upstream.commit=${{ steps.rel.outputs.sha }}
+            org.agents-anywhere.upstream.license=none-declared
+            org.agents-anywhere.built-by=github.com/${{ github.repository }}
+          tags: ${{ steps.tags.outputs.tags }}
+          # 关掉证明：它会在 manifest 里塞进 attestation 条目，个别旧版 Docker 拉取时报
+          # unknown/unknown platform。要溯源就跑 `docker buildx imagetools inspect`。
+          provenance: false
+          # 复用上一次的层缓存（yarn / uv 那几层没变就不用重装）。scope 与另一条流水线错开。
+          cache-from: type=gha,scope=agents-anywhere
+          cache-to: type=gha,mode=max,scope=agents-anywhere
+
+      - name: 输出结果
+        if: steps.check.outputs.need_build == '1'
+        env:
+          GHCR: ${{ steps.image.outputs.ghcr }}
+          TAG: ${{ steps.rel.outputs.tag }}
+          PROBE: ${{ steps.check.outputs.probe_tag }}
+          IS_LATEST: ${{ steps.rel.outputs.is_latest }}
+          HTML: ${{ steps.rel.outputs.html }}
+        run: |
+          {
+            echo "## Agents-Anywhere 镜像已推送"
+            echo ""
+            echo "拉取（可直接复制）："
+            echo ""
+            echo '```bash'
+            echo "docker pull ${GHCR}:${TAG}"
+            if [ "${IS_LATEST}" = "1" ]; then
+              echo "docker pull ${GHCR}:latest"
+            fi
+            echo '```'
+            echo ""
+            echo "标签："
+            echo ""
+            echo '```'
+            if [ "${IS_LATEST}" = "1" ]; then
+              echo "${GHCR}:latest          # 最新一份 release"
+            fi
+            echo "${GHCR}:${TAG}          # 对应上游 release"
+            echo "${GHCR}:${PROBE}    # 内容寻址（release 的提交前 12 位）"
+            echo '```'
+            echo ""
+            echo "平台：linux/amd64（单架构 —— Next.js 构建在 QEMU 下不可用）"
+            echo ""
+            echo "上游 release：${HTML}"
+            echo ""
+            echo "> ⚠️ 上游仓库**未声明 License**（GitHub API 返回 null）。要把这个包设为私有："
+            echo "> Packages → agents-anywhere → Package settings → Change visibility。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 无变化时的小结
+        if: steps.check.outputs.need_build != '1'
+        run: |
+          {
+            echo "## 上游没有新 release，已跳过构建"
+            echo ""
+            echo "当前镜像已对应 release \`${{ steps.rel.outputs.tag }}\`"
+            echo "（提交 \`${{ steps.rel.outputs.sha }}\`，探测标签 \`${{ steps.check.outputs.probe_tag }}\`）。"
+            echo ""
+            echo "想强制重建：Actions → agents-anywhere → Run workflow，勾上 force；"
+            echo "想重建某个历史版本：同一个入口，在 tag 里填例如 \`v2.0.0\`。"
+          } >> "$GITHUB_STEP_SUMMARY"
