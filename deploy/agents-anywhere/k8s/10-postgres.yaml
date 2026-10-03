@@ -1,0 +1,140 @@
+# PostgreSQL：整套服务的**唯一事实来源**（会话、Timeline、账号……都在这）。
+# 版本与参数照上游 docker/docker-compose.postgres.yml：postgres:17-alpine，库/用户都叫 agents_anywhere。
+#
+# ⚠️ 别给这个容器设 `runAsNonRoot` —— 官方 postgres 镜像的入口脚本要先以 root 身份把数据目录
+#    的属主改成 postgres(999)，再降权启动；强制非 root 会让它直接起不来。Redis 同理（见 20-redis.yaml）。
+
+---
+# 数据盘。hostPath 静态供给（你集群没有默认 StorageClass），Retain：删 PVC 不删数据。
+# 多节点集群必须给 PV 钉节点或换 CSI，否则 Pod 落到别的节点会看到「空库」——
+# 详见 README 的「多节点」一节。
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: agents-anywhere-postgres
+  labels:
+    app.kubernetes.io/part-of: agents-anywhere
+spec:
+  capacity:
+    storage: 5Gi
+  accessModes: ["ReadWriteOnce"]
+  persistentVolumeReclaimPolicy: Retain
+  # 空字符串 = 静态供给（不走 StorageClass）。必须与 PVC 一致。
+  storageClassName: ""
+  volumeMode: Filesystem
+  hostPath:
+    path: /srv/agents-anywhere/postgres
+    type: DirectoryOrCreate
+  # 钉住目标 PVC：静态供给时若不加 claimRef，别的 PVC 可能先把这块 PV 抢走。
+  claimRef:
+    namespace: agents-anywhere
+    name: agents-anywhere-postgres
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: agents-anywhere-postgres
+  namespace: agents-anywhere
+spec:
+  storageClassName: ""
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 5Gi
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: agents-anywhere
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: agents-anywhere
+spec:
+  replicas: 1
+  strategy:
+    # 单实例数据库：不允许新旧两个 Postgres 同时挂同一份数据目录。
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+        app.kubernetes.io/part-of: agents-anywhere
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:17-alpine
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POSTGRES_DB
+              value: agents_anywhere
+            - name: POSTGRES_USER
+              value: agents_anywhere
+            # 密码只在 Secret 里（命令见 30-server.yaml 顶部）。
+            # 用 `openssl rand -hex 32` 生成：只含 0-9a-f，拼进 DB URL 不需要转义。
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: agents-anywhere-secret
+                  key: postgres-password
+            # 连接数上限：默认 100。上游给「4 worker」那份 profile 才提到 200
+            # （每个 worker 的连接池是 10 + 20 overflow）—— 你要加 worker 就同步提这个值。
+            # - name: POSTGRES_INITDB_ARGS
+            #   value: "--data-checksums"
+          ports:
+            - name: pg
+              containerPort: 5432
+          # 探针用上游 compose 的 healthcheck 同款命令。
+          # 首次 initdb 可能要十几秒，所以 startupProbe 放宽（2s × 30 = 60s）。
+          startupProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U agents_anywhere -d agents_anywhere"]
+            periodSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U agents_anywhere -d agents_anywhere"]
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U agents_anywhere -d agents_anywhere"]
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: agents-anywhere-postgres
+
+---
+# 只集群内可达：server 用服务名 postgres:5432 连它，不需要对外暴露。
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: agents-anywhere
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: agents-anywhere
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: postgres
+  ports:
+    - name: pg
+      port: 5432
+      targetPort: pg

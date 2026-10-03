@@ -1,0 +1,15 @@
+# Agents-Anywhere 的命名空间。
+#
+# 为什么单独一个：这套服务与 WorkBuddy 那套完全无关（不同的库、不同的凭据），
+# 混在一个命名空间里只会让 RBAC、配额和「删错东西」的风险变大。
+#
+# 部署顺序：00-namespace → 建 Secret → 10-postgres → 20-redis → 30-server
+#   kubectl apply -f deploy/agents-anywhere/k8s/00-namespace.yaml
+#   （Secret 的创建命令见 30-server.yaml 顶部的注释）
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: agents-anywhere
+  labels:
+    app.kubernetes.io/part-of: agents-anywhere

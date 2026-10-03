@@ -1,0 +1,104 @@
+# 用「预构建镜像」跑 Agents-Anywhere（服务端 + Postgres + Redis）。
+#
+# 与上游 docker/docker-compose.postgres.yml 的差别只有一处：
+#   migrate / server 两个服务把 `build: {context: .., dockerfile: docker/Dockerfile}`
+#   换成 `image: ghcr.io/smagicalk/agents-anywhere:latest`（本仓库 CI 打好的镜像，不本地编译）。
+#   其余（Postgres 17 / Redis 8 的镜像与参数、环境变量、卷、端口）都保持上游原样，行为一致。
+#
+# 起法：
+#   POSTGRES_PASSWORD=$(openssl rand -hex 32) \
+#   AGENT_SERVER_SECRET=$(openssl rand -hex 32) \
+#   docker compose up -d
+#   docker compose logs -f server     # 首次空库会打印引导 token（用它创建第一个管理员）
+#
+# ⚠️ 密码用 hex（只含 0-9a-f）：下面 DB URL 是拼字符串的，密码里出现 @ : / 会把它拆坏。
+
+name: agents-anywhere
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: agents_anywhere
+      POSTGRES_USER: agents_anywhere
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-agents_anywhere_dev_password}
+    volumes:
+      - agents-anywhere-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agents_anywhere -d agents_anywhere"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:8-alpine
+    restart: unless-stopped
+    # 上游明确要求：AOF 开着（appendfsync everysec）、RDB 关掉、maxmemory-policy=noeviction。
+    # 这些 key 没有 TTL，被驱逐就等于丢数据。
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory
+      - ${REDIS_MAXMEMORY:-256mb}
+      - --maxmemory-policy
+      - noeviction
+    volumes:
+      - agents-anywhere-redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # 一次性迁移：等 Postgres 健康后升级库结构，跑完退出（server 依赖它成功）。
+  migrate:
+    image: ghcr.io/smagicalk/agents-anywhere:latest
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      AGENT_SERVER_DB_BACKEND: postgres
+      AGENT_SERVER_DB_URL: postgresql+asyncpg://agents_anywhere:${POSTGRES_PASSWORD:-agents_anywhere_dev_password}@postgres:5432/agents_anywhere
+      AGENT_SERVER_MIGRATION_LOCK_TIMEOUT: ${AGENT_SERVER_MIGRATION_LOCK_TIMEOUT:-120}
+    command: ["sh", "-c", "cd /app/server && uv run --no-sync python -m agent_server.infra.db.migrations upgrade"]
+
+  server:
+    image: ghcr.io/smagicalk/agents-anywhere:latest
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    environment:
+      AGENT_SERVER_DB_BACKEND: postgres
+      AGENT_SERVER_DB_URL: postgresql+asyncpg://agents_anywhere:${POSTGRES_PASSWORD:-agents_anywhere_dev_password}@postgres:5432/agents_anywhere
+      AGENT_SERVER_DB_POOL_SIZE: ${AGENT_SERVER_DB_POOL_SIZE:-10}
+      AGENT_SERVER_DB_MAX_OVERFLOW: ${AGENT_SERVER_DB_MAX_OVERFLOW:-20}
+      AGENT_SERVER_DB_POOL_TIMEOUT: ${AGENT_SERVER_DB_POOL_TIMEOUT:-30}
+      AGENT_SERVER_DB_POOL_RECYCLE: ${AGENT_SERVER_DB_POOL_RECYCLE:-1800}
+      AGENT_SERVER_REDIS_URL: redis://redis:6379/0
+      AGENT_SERVER_REDIS_CONNECT_TIMEOUT: ${AGENT_SERVER_REDIS_CONNECT_TIMEOUT:-5}
+      AGENT_SERVER_TIMELINE_REVISION_LEASE_SIZE: ${AGENT_SERVER_TIMELINE_REVISION_LEASE_SIZE:-4096}
+      AGENT_SERVER_FILES_BACKEND: local
+      AGENT_SERVER_FILES_LOCAL_ROOT: /data/agent-server.files
+      AGENT_SERVER_SECRET: ${AGENT_SERVER_SECRET:-change-me-before-production}
+      # 反向代理后面部署时填上真实对外地址（OAuth 回调要用），例如 https://agents.example.com
+      AGENT_SERVER_PUBLIC_ORIGIN: ${AGENT_SERVER_PUBLIC_ORIGIN:-}
+      AGENT_SERVER_CORS_ORIGINS: ${AGENT_SERVER_CORS_ORIGINS:-http://127.0.0.1:${AGENTS_ANYWHERE_WEB_PORT:-5174},http://localhost:${AGENTS_ANYWHERE_WEB_PORT:-5174}}
+    volumes:
+      - agents-anywhere-files:/data
+    ports:
+      # 默认只绑本机：生产要放在 HTTPS 反代后面（上游文档也这么要求）。
+      - "127.0.0.1:${AGENTS_ANYWHERE_WEB_PORT:-5174}:8000"
+
+volumes:
+  agents-anywhere-pg:
+  agents-anywhere-redis:
+  agents-anywhere-files:

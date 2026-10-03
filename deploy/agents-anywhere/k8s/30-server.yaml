@@ -1,0 +1,274 @@
+# 服务端：FastAPI 后端 + 静态导出的 Web 控制台（同源，8000 端口）。
+#
+# 先建 Secret 再 apply（**刻意不放进清单**：放进去每次 apply 都会用占位值把真密钥覆盖回去）：
+#
+#   kubectl -n agents-anywhere create secret generic agents-anywhere-secret \
+#     --from-literal=postgres-password="$(openssl rand -hex 32)" \
+#     --from-literal=agent-server-secret="$(openssl rand -hex 32)" \
+#     --dry-run=client -o yaml | kubectl apply -f -
+#
+#   两个值都用 hex（只含 0-9a-f）：下面 AGENT_SERVER_DB_URL 是**拼字符串**拼出来的，
+#   密码里出现 @ : / 会把这个 URL 拆坏（而 kubectl 的 `$(VAR)` 展开只做文本替换，
+#   不存在 URL 转义）。
+#
+# ── 三个上游明确写过的约束，这份清单是照着来的 ─────────────────────
+#   1. strategy 用 Recreate（不是 RollingUpdate）：上游文档说不同版本的写者**绝不可同时**
+#      跑同一个库，滚动更新会让新旧 Pod 并存几秒 —— 那正是它警告的情况。
+#   2. 迁移用一个 init 容器（对应上游 compose 的 migrate 服务）：每次 Pod 启动先跑
+#      `migrations upgrade`（幂等，只应用未应用的），跑完才起服务。
+#   3. 首次是空库时**必须单 worker**（默认就是 1）：初始 setup token 只存在于那个进程里、
+#      打印在日志中。想开多 worker / 多副本，先完成引导，再按上游 8cpu 那份 profile 加
+#      `AGENT_SERVER_WORKERS` 并把 `AGENT_SERVER_TIMELINE_SINGLE_INSTANCE` 设为 false。
+
+---
+# /data：上传与附件（AGENT_SERVER_FILES_BACKEND=local）。丢了等于附件没了，库还在。
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: agents-anywhere-files
+  labels:
+    app.kubernetes.io/part-of: agents-anywhere
+spec:
+  capacity:
+    storage: 5Gi
+  accessModes: ["ReadWriteOnce"]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  volumeMode: Filesystem
+  hostPath:
+    path: /srv/agents-anywhere/files
+    type: DirectoryOrCreate
+  claimRef:
+    namespace: agents-anywhere
+    name: agents-anywhere-files
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: agents-anywhere-files
+  namespace: agents-anywhere
+spec:
+  storageClassName: ""
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 5Gi
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: server
+  namespace: agents-anywhere
+  labels:
+    app.kubernetes.io/name: server
+    app.kubernetes.io/part-of: agents-anywhere
+spec:
+  replicas: 1
+  strategy:
+    # 见文件开头第 1 条：不允许新旧写者并存（滚动更新会并存）。
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: server
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: server
+        app.kubernetes.io/part-of: agents-anywhere
+    spec:
+      initContainers:
+        # ① 等 Postgres 能连（对应 compose 的 depends_on: service_healthy）。
+        #    用镜像自带的 python3 做 TCP 探测，不依赖 psql/nc。
+        - name: wait-for-postgres
+          image: ghcr.io/smagicalk/agents-anywhere:latest
+          imagePullPolicy: Always
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              i=0
+              until python3 -c 'import socket; s=socket.socket(); s.settimeout(2); s.connect(("postgres", 5432)); s.close()' 2>/dev/null; do
+                i=$((i + 1))
+                if [ "$i" -gt 60 ]; then
+                  echo "[init] 等 Postgres 超过 120 秒，放弃"
+                  exit 1
+                fi
+                echo "[init] 等 Postgres 就绪（第 ${i} 次）"
+                sleep 2
+              done
+              echo "[init] Postgres 可连接"
+        # ② 跑迁移（命令与上游 compose 的 migrate 服务逐字一致）。
+        - name: migrate
+          image: ghcr.io/smagicalk/agents-anywhere:latest
+          imagePullPolicy: Always
+          command: ["sh", "-c", "cd /app/server && uv run --no-sync python -m agent_server.infra.db.migrations upgrade"]
+          env:
+            - name: AGENT_SERVER_DB_BACKEND
+              value: postgres
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: agents-anywhere-secret
+                  key: postgres-password
+            # 与下面容器同一套拼法（kubectl 会展开同容器内先定义的 $(POSTGRES_PASSWORD)）。
+            - name: AGENT_SERVER_DB_URL
+              value: postgresql+asyncpg://agents_anywhere:$(POSTGRES_PASSWORD)@postgres:5432/agents_anywhere
+            - name: AGENT_SERVER_MIGRATION_LOCK_TIMEOUT
+              value: "120"
+      containers:
+        - name: server
+          image: ghcr.io/smagicalk/agents-anywhere:latest
+          # 镜像由本仓库 CI 构建，标签是 latest：必须每次拉取，否则节点上会一直复用旧镜像。
+          imagePullPolicy: Always
+          env:
+            # ── 数据库 ────────────────────────────────────────────────
+            - name: AGENT_SERVER_DB_BACKEND
+              value: postgres
+            # 密码单独取一次，再由 kubectl 展开进 URL（避免同一份密码存两处、日后漂移）。
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: agents-anywhere-secret
+                  key: postgres-password
+            - name: AGENT_SERVER_DB_URL
+              value: postgresql+asyncpg://agents_anywhere:$(POSTGRES_PASSWORD)@postgres:5432/agents_anywhere
+            - name: AGENT_SERVER_DB_POOL_SIZE
+              value: "10"
+            - name: AGENT_SERVER_DB_MAX_OVERFLOW
+              value: "20"
+            - name: AGENT_SERVER_DB_POOL_TIMEOUT
+              value: "30"
+            - name: AGENT_SERVER_DB_POOL_RECYCLE
+              value: "1800"
+            # ── Redis（协调 / Pub/Sub / Timeline 序号）────────────────
+            - name: AGENT_SERVER_REDIS_URL
+              value: redis://redis:6379/0
+            - name: AGENT_SERVER_REDIS_CONNECT_TIMEOUT
+              value: "5"
+            - name: AGENT_SERVER_TIMELINE_REVISION_LEASE_SIZE
+              value: "4096"
+            # ── 文件（上传/附件）──────────────────────────────────────
+            - name: AGENT_SERVER_FILES_BACKEND
+              value: local
+            - name: AGENT_SERVER_FILES_LOCAL_ROOT
+              value: /data/agent-server.files
+            # ── 身份与对外地址 ───────────────────────────────────────
+            # 签名密钥：只在 Secret 里，换了等于所有会话失效。
+            - name: AGENT_SERVER_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: agents-anywhere-secret
+                  key: agent-server-secret
+            # 对外地址：**反代后面必须填**，否则 OAuth 回调会指到容器里的地址。
+            # 填你的 Ingress 域名，例如 https://agents.example.com
+            # - name: AGENT_SERVER_PUBLIC_ORIGIN
+            #   value: https://agents.example.com
+            # 浏览器跨域白名单：控制台与 API **同源**（前端 `/` 与 API `/api/v2` 都由这个容器发），
+            # 所以同源部署**不需要** CORS，这几行留注释即可；只有把前端放到别的域名时才要设。
+            # 上游 compose 的默认值是 http://127.0.0.1:5174,http://localhost:5174
+            # （另有 AGENT_SERVER_CORS_ORIGIN_REGEX，默认放行 http://127.0.0.1:* 与 http://localhost:*）。
+            # - name: AGENT_SERVER_CORS_ORIGINS
+            #   value: https://agents.example.com
+            # 监听地址：镜像里已是 0.0.0.0，这里再写一遍防止被镜像默认值（127.0.0.1）坑到。
+            - name: AGENT_SERVER_HOST
+              value: 0.0.0.0
+            - name: AGENT_SERVER_PORT
+              value: "8000"
+          ports:
+            - name: http
+              containerPort: 8000
+          # 上游的两个健康端点（源码 app.py）：
+          #   /api/v2/health/live  —— 只说明进程活着 → 当 startup/liveness
+          #   /api/v2/health/ready —— 依赖（库/Redis/Timeline）不通时返回 **503** → 只当 readiness
+          startupProbe:
+            httpGet:
+              path: /api/v2/health/live
+              port: http
+            periodSeconds: 2
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /api/v2/health/ready
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/v2/health/live
+              port: http
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          securityContext:
+            # 镜像以 root 运行（上游 Dockerfile 没有 USER），所以不设 runAsNonRoot；
+            # 但也不需要任何提权：监听 8000、读写 /data 而已。
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: files
+              mountPath: /data
+      volumes:
+        - name: files
+          persistentVolumeClaim:
+            claimName: agents-anywhere-files
+
+---
+# 对外入口。**生产必须配 TLS**：这东西管着你的 agent 与凭据。
+apiVersion: v1
+kind: Service
+metadata:
+  name: server
+  namespace: agents-anywhere
+  labels:
+    app.kubernetes.io/name: server
+    app.kubernetes.io/part-of: agents-anywhere
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: server
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+
+---
+# ── Ingress 示例（可选；公网使用必配 TLS）──────────────────────────
+# 控制台与 API 同源：前端在 /，API 在 /api/v2。
+# 这个应用会上传附件，所以把 body size 放大（nginx 默认 1m 会把上传挡掉）。
+# 源码里还有客户端 WebSocket（client_ws）与仪表盘的流式推送（dashboard_stream）：
+# nginx-ingress 默认就支持 WebSocket，流式那条则要关掉缓冲（proxy-buffering off）。
+#
+# apiVersion: networking.k8s.io/v1
+# kind: Ingress
+# metadata:
+#   name: agents-anywhere
+#   namespace: agents-anywhere
+#   annotations:
+#     nginx.ingress.kubernetes.io/proxy-body-size: "512m"
+#     nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+#     nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+#     nginx.ingress.kubernetes.io/proxy-buffering: "off"
+# spec:
+#   ingressClassName: nginx
+#   tls:
+#     - hosts: ["agents.example.com"]
+#       secretName: agents-anywhere-tls
+#   rules:
+#     - host: agents.example.com
+#       http:
+#         paths:
+#           - path: /
+#             pathType: Prefix
+#             backend:
+#               service:
+#                 name: server
+#                 port:
+#                   number: 8000
