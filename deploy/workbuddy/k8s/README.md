@@ -55,7 +55,7 @@
 | 文件 | 内容 |
 |---|---|
 | `00-namespace.yaml` | 命名空间 `workbuddy`（PV 的 `claimRef` 依赖它） |
-| `10-stack.yaml` | 4 PV + 4 PVC + Deployment（两个容器）+ 2 Service +（注释掉的）Ingress |
+| `10-stack.yaml` | 4 PV + 4 PVC + Deployment（两个容器）+ 2 Service +（注释掉的）HTTPRoute（Gateway API） |
 
 ```bash
 kubectl apply -f deploy/workbuddy/k8s/      # 按文件名顺序应用
@@ -219,6 +219,29 @@ curl -s http://127.0.0.1:7863/healthz
 `/healthz` 的 `healthy` / `total` 就是账号数。**账号池为空时它返回 503**，
 这是上游的设计（判「能不能受理请求」），加进第一个账号就变 200 —— 不是装坏了。
 面板的 `/api/healthz` 不受影响，一直是 200。
+
+### 对外暴露（Gateway API / HTTPRoute）
+
+`10-stack.yaml` 尾部有一份**注释掉的 HTTPRoute 示例**（`gateway.networking.k8s.io/v1`）：取消注释、
+把 `hostnames` 换成你的域名即可，后端是面板的 Service `workbuddy-manager`（7864）。四点关键：
+
+- **不写 TLS**：TLS 在网关的 listener 上（示例的 `parentRefs` 指向 `sectionName: https`）——
+  与 Ingress 那种在资源里写 `tls` 不同。公网使用务必配 TLS。
+- **必须关超时**：面板的日志 / 用量是 SSE 流式返回，网关不关超时（Envoy 的 route timeout 默认
+  15 秒）会把「流式」掐断或攒成整块 —— 示例按规范把 `timeouts.request` / `backendRequest` 设成 `0s`。
+- **跨命名空间挂载要网关允许**：路由在 `workbuddy`、网关在 `istio-system`，需要网关 listener 的
+  `allowedRoutes.namespaces.from` 允许，否则路由被**静默忽略**（看
+  `kubectl get httproute -n workbuddy` 的 `Accepted` / `ResolvedRefs`）。
+- **真实 IP 链路要一起核对**（换网关最容易漏这条）：面板优先采信 `X-Real-IP`，但**只在 TCP 对端
+  属于 `WB_TRUSTED_PROXY_CIDRS` 时**；nginx-ingress 会写 X-Real-IP，**Envoy / Istio 不写**，只追加
+  `X-Forwarded-For` —— 单网关下 `WB_TRUSTED_PROXY_HOPS=1` 依然正确。但若你的 Pod CIDR 不在默认可信
+  网段（127/8、::1、10/8、172.16/12、192.168/16、fc00::/7）里，面板记到的会是**网关 IP**，IP 白/黑名单
+  与登录失败按 IP 锁定都会跟着错 —— 用 `WB_TRUSTED_PROXY_CIDRS` 把 Pod CIDR 补上（清单里已留注释示例）。
+
+> 集群里只有 ingress-nginx（`kubectl get gatewayclass` 为空）？那就自己写 Ingress，带上
+> `proxy-buffering: "off"`、放宽 `proxy-read-timeout` / `proxy-send-timeout`、`proxy-body-size`
+> （面板自己的请求体上限是上游旧键 `server.max_body_mb` 或 `WB_GATEWAY_MAX_BODY_MB`，默认 32 MB）。
+> nginx 会写 X-Real-IP，上面那条真实 IP 链路天然成立。
 
 ### 升级
 

@@ -531,8 +531,17 @@ spec:
             # 不用写 WB_UPSTREAM_CONFIG / WB_AUTH_DIR / WB_UPSTREAM_DIR：
             # 它们的默认值就是 /opt/workbuddy2api/{config.json,auths}，正好是下面挂进去的
             # 那块共享目录 —— 也正是官方 Docker 部署里 `../workbuddy2api:/opt/workbuddy2api` 的形态。
-            # 真实 IP：Ingress 后面的反代（ingress-nginx 默认就会带 X-Real-IP）。
-            # 默认已是 1；若前面再叠一层 CDN，把它改成 CDN+反代的层数。
+            # 真实 IP 链路（源码 server/iputil.py）：面板优先采信 X-Real-IP，但**只在 TCP 对端
+            # 属于 WB_TRUSTED_PROXY_CIDRS 时**；否则退回 X-Forwarded-For 右侧第 N 跳（N = hops）。
+            #   · nginx-ingress 会写 X-Real-IP；Envoy / Istio **不写**，只往 XFF 追加对端地址 ——
+            #     单网关下右侧第 1 跳就是真实客户端，所以 hops=1 依然正确。
+            #   · 前面再叠一层 CDN：hops 改成 CDN+网关的层数，并把 CDN 回源网段加进可信网段。
+            #   · 可信网段默认已含 127/8、::1、10/8、172.16/12、192.168/16、fc00::/7（集群 Pod CIDR
+            #     通常在其中）。若你的 Pod CIDR 不在这几段里，面板记到的会是**网关 IP**，IP 白/黑名单
+            #     与登录失败按 IP 锁定都会跟着错 —— 把 Pod CIDR 补进下面这个变量：
+            # - name: WB_TRUSTED_PROXY_CIDRS
+            #   value: "127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7"
+            # （WB_TRUST_PROXY 与 hops 的默认值本来就是 1 和 1，写出来是为了显眼。）
             - name: WB_TRUST_PROXY
               value: "1"
             - name: WB_TRUSTED_PROXY_HOPS
@@ -627,7 +636,7 @@ spec:
           emptyDir: {}
 
 ---
-# 面板：整套部署的对外入口（下面的 Ingress 指向它）。
+# 面板：整套部署的对外入口（下面的 HTTPRoute 指向它）。
 apiVersion: v1
 kind: Service
 metadata:
@@ -667,34 +676,59 @@ spec:
       targetPort: api
 
 ---
-# ── 对外入口（可选，但公网使用必配 TLS）────────────────────────────
-# 面板会流式返回（SSE）：反代必须关缓冲、放宽超时，否则「流式」会被中间层
-# 攒成一整块，等于把流式白做了。
+# ── 对外入口：Gateway API（HTTPRoute，可选，但公网使用必配 TLS）────────────
+# 用你集群里现成的 Gateway（示例是 istio-system 里的 istio-gateway，同时挂在 http 与
+# https 两个 listener 上）。后端是面板的 Service `workbuddy-manager`（7864）。
 #
-# apiVersion: networking.k8s.io/v1
-# kind: Ingress
+# 面板会流式返回（SSE）：网关**必须关超时**，否则「流式」会被中间层的默认超时（Envoy 的
+# route timeout 默认 15 秒）掐断、或攒成一整块再发出来，等于把流式白做了。示例按 Gateway API
+# 规范把 timeouts.request / backendRequest 设成 0s —— 规范原文：zero duration（"0s"）
+# SHOULD disable the timeout completely（即 0s = 彻底关掉）。该字段属 **Extended** 特性，
+# 需要网关实现支持。
+#
+# 三点与 Ingress 不同：
+#   1. TLS 在**网关的 listener** 上（parentRefs 里 https 那一段），HTTPRoute 里不用写 tls ——
+#      只想走 https 就删掉 http 那段 parentRef。
+#   2. 跨命名空间挂载要网关允许：本路由在 workbuddy、网关在 istio-system，需要网关 listener 的
+#      allowedRoutes.namespaces.from 允许（All，或 Selector 命中本命名空间）。没允许的话路由会被
+#      **静默忽略** —— 用 kubectl get httproute -n workbuddy 看 Accepted / ResolvedRefs。
+#   3. 请求体：Envoy / Istio 没有 nginx 那种 1m 的默认上限，这里不用配。真正的上限在面板自己：
+#      上游配置 `server.max_body_mb`（仅旧版上游还有这个键）或 `WB_GATEWAY_MAX_BODY_MB`
+#      （默认 32 MB），超了由面板返 413 并提示该变量名（源码 server/routers/gateway.py）。
+#
+# 真实 IP 链路（与上面的 WB_TRUST_PROXY / WB_TRUSTED_PROXY_HOPS 有关，换网关时务必一起核对）：
+#   面板优先采信 `X-Real-IP`，但**只在 TCP 对端属于 WB_TRUSTED_PROXY_CIDRS 时**；否则退回
+#   `X-Forwarded-For` 右侧第 N 跳（N = hops，默认 1）—— 见源码 server/iputil.py。
+#   · nginx-ingress 会写 X-Real-IP；**Envoy / Istio 不写**，只往 XFF 追加对端地址。单网关下
+#     右侧第 1 跳就是真实客户端，所以 hops=1 依然正确（客户端自己塞的 XFF 只会被追加到左边）。
+#   · 前提是「网关的 Pod IP」落在可信网段里（默认 127/8、::1、10/8、172.16/12、192.168/16、
+#     fc00::/7 —— 集群 Pod CIDR 通常在其中）。不在里面时面板记到的是**网关 IP**，
+#     IP 白/黑名单、密钥 IP 白名单、登录失败按 IP 锁定都会跟着错 → 用 WB_TRUSTED_PROXY_CIDRS 补。
+#
+# apiVersion: gateway.networking.k8s.io/v1
+# kind: HTTPRoute
 # metadata:
-#   name: workbuddy-manager
+#   name: workbuddy
 #   namespace: workbuddy
-#   annotations:
-#     nginx.ingress.kubernetes.io/proxy-buffering: "off"
-#     nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
-#     nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
-#     # 面板的网关请求体上限是 8 MiB（WB_GATEWAY_MAX_BODY_MB），这里给足。
-#     nginx.ingress.kubernetes.io/proxy-body-size: "16m"
 # spec:
-#   ingressClassName: nginx
-#   tls:
-#     - hosts: ["wb.example.com"]
-#       secretName: workbuddy-tls
+#   parentRefs:
+#     - name: istio-gateway
+#       namespace: istio-system
+#       sectionName: http
+#     - name: istio-gateway
+#       namespace: istio-system
+#       sectionName: https
+#   hostnames:
+#     - wb.example.com
 #   rules:
-#     - host: wb.example.com
-#       http:
-#         paths:
-#           - path: /
-#             pathType: Prefix
-#             backend:
-#               service:
-#                 name: workbuddy-manager
-#                 port:
-#                   number: 7864
+#     - matches:
+#         - path:
+#             type: PathPrefix
+#             value: /
+#       backendRefs:
+#         - name: workbuddy-manager
+#           port: 7864
+#       # SSE 流式输出不被超时掐断（0s = 关闭）
+#       timeouts:
+#         request: 0s
+#         backendRequest: 0s
