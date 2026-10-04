@@ -19,7 +19,7 @@
 **hostPath 静态 PV**（你的集群没有默认 StorageClass，见「换成 NFS / 云盘」）。
 
 > 被管理的机器上要装的是 connector（上游的 `docker/Dockerfile.connector-*`），**不属于这份
-> 清单**；它用 `AGENT_SERVER_URL` 指向本服务的对外地址（K8s 里就是下面的 Ingress 域名）。
+> 清单**；它用 `AGENT_SERVER_URL` 指向本服务的对外地址（K8s 里就是下面 HTTPRoute 的 hostnames）。
 
 ## 关键设计一览
 
@@ -45,7 +45,7 @@
 | `00-namespace.yaml` | 命名空间 `agents-anywhere`（PV 的 `claimRef` 依赖它） |
 | `10-postgres.yaml` | ExternalName Service（把服务名 `postgres` 指到你的外部库）＋ **自建用**的 PV/PVC（5Gi）+ Deployment（默认 **0 副本**） |
 | `20-redis.yaml` | ExternalName Service（把服务名 `redis` 指过去）＋ **自建用**的 PV/PVC（1Gi）+ Deployment（默认 **0 副本**） |
-| `30-server.yaml` | PV + PVC（5Gi，上传 / 附件）+ Deployment（1 个 init 容器：`migrate`）+ Service +（注释掉的）Ingress |
+| `30-server.yaml` | PV + PVC（5Gi，上传 / 附件）+ Deployment（1 个 init 容器：`migrate`）+ Service +（注释掉的）HTTPRoute（Gateway API） |
 
 ```bash
 # 0) 先把两处 externalName 换成你的外部库主机名（10-postgres.yaml / 20-redis.yaml 各一处）
@@ -145,17 +145,32 @@ curl -s http://127.0.0.1:8000/api/v2/health/ready    # 依赖都通才 200；否
 `/api/v2/health/ready` 的响应里带 `checks.database` / `checks.redis` / `checks.realtime`，
 排障时看它比看 Pod 状态快（`503` 时哪一项是 `error` 就是哪一项挂了）。
 
-## 对外暴露（Ingress）
+## 对外暴露（Gateway API / HTTPRoute）
 
-`30-server.yaml` 尾部有一份**注释掉的 Ingress 示例**：取消注释、把域名换成你的即可。四点注意：
+`30-server.yaml` 尾部有一份**注释掉的 HTTPRoute 示例**（`gateway.networking.k8s.io/v1`）：取消注释、
+把 `hostnames` 换成你的域名即可，后端就是上面那个 Service `server`（8000）。五点注意：
 
-- **必须配 TLS**：这东西管着你的 agent、凭据与会话。上游原话：生产环境要在 Web 服务前面放 HTTPS。
-- **上传**：nginx-ingress 默认 `proxy-body-size: 1m`，稍大一点的文件就被挡（示例里给到 512m）。
-- **长连接**：源码里有客户端 WebSocket 通道（`client_ws`）与仪表盘的流式推送
-  （`dashboard_stream`）—— nginx-ingress 默认支持 WebSocket，流式那条要**关掉缓冲**
-  （`proxy-buffering: "off"`），超时也放宽（示例里是 300 秒）。
+- **不再写 Ingress**：新集群（尤其带 Istio / Envoy 的）基本都用 Gateway API —— 路由与网关解耦、
+  一个 Gateway 能给多个命名空间共用、TLS 与监听器统一在网关侧配。
+- **TLS 在网关的 listener 上**（示例的 `parentRefs` 指向 `sectionName: https`），HTTPRoute 里
+  **不用写 tls** —— 这点与 Ingress 不同。公网务必配 TLS：这东西管着你的 agent、凭据与会话
+  （上游原话：生产环境要在 Web 服务前面放 HTTPS）。
+- **跨命名空间挂载要网关允许**：本路由在 `agents-anywhere`、网关在 `istio-system`，需要网关
+  listener 的 `allowedRoutes.namespaces.from` 允许（`All`，或 `Selector` 命中本命名空间）。
+  没允许的话路由会被**静默忽略** —— 判断方式：`kubectl get httproute -n agents-anywhere` 看
+  `Accepted` / `ResolvedRefs` 两列。
+- **长连接必须关超时**：源码里有客户端 WebSocket（`client_ws`）与仪表盘的流式推送
+  （`dashboard_stream`），而网关对路由有默认超时（Envoy 的 route timeout 默认 15 秒），不关就会
+  把长连接掐断 —— 示例按规范把 `timeouts.request` / `backendRequest` 设成 `0s`（规范原文：
+  zero duration SHOULD disable the timeout completely）。该字段属 Gateway API 的 **Extended**
+  特性，需要网关实现支持；不支持时会被忽略，那就得在网关侧关超时。
+- **上传**：Envoy / Istio 没有 nginx 那种 1m 的默认 body 上限，不用额外配。
 - 用域名访问后请打开清单里注释掉的 `AGENT_SERVER_PUBLIC_ORIGIN`，填 `https://你的域名` ——
   否则 **OAuth 回调**会指向容器内部的地址。
+
+> 集群里**只有 ingress-nginx**（判断方式：`kubectl get gatewayclass` 为空）？那就自己写一份
+> Ingress，把这几个 nginx 注解带上：`proxy-body-size`（默认 1m 会挡住上传）、
+> `proxy-buffering: "off"`（流式推送别缓冲）、`proxy-read-timeout` / `proxy-send-timeout` 放宽。
 
 ## 升级
 
@@ -304,8 +319,9 @@ Pod 从此可以调度到任意节点。
 | server 日志 `password authentication failed` | Secret 里的密码与库里的不一致 —— `POSTGRES_PASSWORD` 只在**空数据目录**的 `initdb` 时用过一次，之后改 Secret 不会改库里的密码，要 `ALTER USER`（见「换密码」） |
 | server 报 URL/DSN 解析错误 | 密码里有 `@ : /` 之类字符。`AGENT_SERVER_DB_URL` 是拼字符串拼出来的，只许用 hex |
 | 日志里反复出现新的 `setup-token` | 库还是空的（`users` 表没有行）→ 每次 Pod 重启都会重新生成。**不是坏了**，是还没完成引导；另外别把 Pod 反复重启（token 是进程内的，重启就换） |
-| 界面能打开但上传报 413 | Ingress 的 `proxy-body-size` 太小（默认 1m），见「对外暴露」 |
-| 仪表盘/日志流卡住、半天没新内容 | 反代缓冲没关：`proxy-buffering: "off"` |
+| 界面能打开但上传被挡 / 413 | 你的网关有 body 上限：**Envoy / Istio 默认没有**（不用配）；nginx 系的是 `proxy-body-size`（默认 1m），见「对外暴露」 |
+| 仪表盘 / 日志流卡住、半天没新内容，或长连接被断开 | 网关把流式响应缓冲了、或路由超时把连接掐了：HTTPRoute 里 `timeouts: {request: 0s, backendRequest: 0s}`（Envoy 的 route timeout 默认 15 秒）；nginx 侧是 `proxy-buffering: "off"` + 放宽 read/send 超时 |
+| HTTPRoute 已 apply，但域名打不开 / 404 | 先看 `kubectl get httproute -n agents-anywhere` 的 `Accepted` 与 `ResolvedRefs`：跨命名空间时网关 listener 的 `allowedRoutes` 没允许本命名空间，或 `backendRefs` 名字/端口写错（本清单是 `server:8000`，端口是 **Service 的 port**） |
 | 浏览器报 CORS 错 | 你把前端放到了**另一个域名**。同源部署（本清单默认）不需要 CORS；跨源时才设 `AGENT_SERVER_CORS_ORIGINS`（或用 `AGENT_SERVER_CORS_ORIGIN_REGEX` 放行） |
 | OAuth 登录回调跳到 `127.0.0.1` 之类 | `AGENT_SERVER_PUBLIC_ORIGIN` 没设成对外域名（反代后面必须设） |
 | 改了 `AGENT_SERVER_WORKERS` 后起不来，日志说多 worker 需要 Redis / 要关 single-instance | 见「扩 worker」：多 worker 必须配 Redis 且 `AGENT_SERVER_TIMELINE_SINGLE_INSTANCE=false`；被拒绝启动是**刻意**的保护 |
@@ -320,7 +336,7 @@ Pod 从此可以调度到任意节点。
 | `postgres-next` / `redis-next`（官方镜像 + named volume + healthcheck） | 换成**外部服务**：`10-postgres.yaml` / `20-redis.yaml` 各留一个 `ExternalName` Service，把 `postgres` / `redis` 这两个名字指到你的外部主机；文件里仍保留自建版（PV/PVC + Deployment，**默认 0 副本**）与照抄的镜像/参数 —— 要自建就把 `replicas` 改回 1、Service 换回 `ClusterIP` |
 | `migrate-next`（一次性服务，`depends_on: postgres service_healthy`，命令 + `AGENT_SERVER_MIGRATION_LOCK_TIMEOUT`） | init 容器 `migrate`（命令逐字一致、锁超时同样是 120 秒）。`depends_on` **不翻译**：这里去掉了等待（原来的 `wait-for-postgres` 已移除）—— 外部库起不来就让 migrate 失败重试、readiness 报 503 |
 | `server-next`（`depends_on: migrate completed_successfully` + 一整套 env + `/data` 卷） | `30-server.yaml` 的主容器（env 与它同一套默认值：池 10/20/30/1800、Redis 连接超时 5、序号租约 4096、文件后端 local） |
-| `${AGENTS_ANYWHERE_WEB_PORT:-5174}:8000` | Service `server` 的 8000 + Ingress（或 `port-forward 5174:8000`） |
+| `${AGENTS_ANYWHERE_WEB_PORT:-5174}:8000` | Service `server` 的 8000 + HTTPRoute（Gateway API；或用 `port-forward 5174:8000`） |
 | `AGENT_SERVER_CORS_ORIGINS` 默认 `http://127.0.0.1:5174,http://localhost:5174` | 注释掉 —— 同源部署不需要 CORS，要跨源时再打开 |
 | （镜像自带的 env） | 清单里**没有**重复设 `AGENT_SERVER_STATIC_DIR` / `AGENT_SERVER_DB_BACKEND`（后端显式设了）/ `AGENT_SERVER_HOST`（显式设了一遍防被镜像默认值坑到） |
 

@@ -152,7 +152,7 @@ spec:
                   name: agents-anywhere-secret
                   key: agent-server-secret
             # 对外地址：**反代后面必须填**，否则 OAuth 回调会指到容器里的地址。
-            # 填你的 Ingress 域名，例如 https://agents.example.com
+            # 填你的网关域名（HTTPRoute 的 hostnames），例如 https://agents.example.com
             # - name: AGENT_SERVER_PUBLIC_ORIGIN
             #   value: https://agents.example.com
             # 浏览器跨域白名单：控制台与 API **同源**（前端 `/` 与 API `/api/v2` 都由这个容器发），
@@ -230,35 +230,53 @@ spec:
       targetPort: http
 
 ---
-# ── Ingress 示例（可选；公网使用必配 TLS）──────────────────────────
-# 控制台与 API 同源：前端在 /，API 在 /api/v2。
-# 这个应用会上传附件，所以把 body size 放大（nginx 默认 1m 会把上传挡掉）。
-# 源码里还有客户端 WebSocket（client_ws）与仪表盘的流式推送（dashboard_stream）：
-# nginx-ingress 默认就支持 WebSocket，流式那条则要关掉缓冲（proxy-buffering off）。
+# ── 对外暴露：Gateway API（HTTPRoute）示例（可选；公网使用必配 TLS）──────────
+# 用你集群里现成的 Gateway（示例是 istio-system 里的 istio-gateway，同时挂在
+# http 与 https 两个 listener 上）。取消注释、把 hostnames 换成你的域名即可；
+# 后端就是上面的 Service `server`（8000），控制台 `/` 与 API `/api/v2` 同源。
 #
-# apiVersion: networking.k8s.io/v1
-# kind: Ingress
+# 为什么不写 Ingress：新集群（尤其带 Istio / Envoy 的）基本都用 Gateway API ——
+# 路由与网关解耦、一个 Gateway 可以给多个命名空间共用、TLS 与监听器统一在网关侧配。
+#
+# 四点注意：
+#   1. TLS 在**网关的 listener** 上（parentRefs 里 https 那一段），HTTPRoute 里不用写 tls
+#      —— 这点与 Ingress 不同。只想走 https 就删掉 http 那段 parentRef。
+#   2. 跨命名空间挂载要网关允许：本路由在 agents-anywhere、网关在 istio-system，需要网关
+#      listener 的 allowedRoutes.namespaces.from 允许（All，或 Selector 命中本命名空间）。
+#      没允许的话路由会被**静默忽略** —— 先去 kubectl get httproute -n agents-anywhere 看
+#      Accepted / ResolvedRefs 两列。
+#   3. timeouts 要设 0s：源码里有仪表盘的流式推送（dashboard_stream）与客户端 WebSocket
+#      （client_ws），而网关对路由有默认超时（Envoy 的 route timeout 默认 15 秒），不关就会
+#      把长连接掐断。Gateway API 规范原文：zero duration（"0s"）SHOULD disable the timeout
+#      completely —— 即 0s = 彻底关掉（实现若无法彻底关闭，规范要求它按「最长值」处理）。
+#      timeouts 属 **Extended** 特性，需要网关实现支持；不支持时该字段被忽略，就得在网关侧关。
+#   4. 上传：Envoy / Istio 没有 nginx 那种 1m 的默认 body 上限，这里不用配。（若你的集群只有
+#      ingress-nginx，就按 nginx 的做法自己写 Ingress：proxy-body-size、proxy-buffering off。）
+#
+# apiVersion: gateway.networking.k8s.io/v1
+# kind: HTTPRoute
 # metadata:
 #   name: agents-anywhere
 #   namespace: agents-anywhere
-#   annotations:
-#     nginx.ingress.kubernetes.io/proxy-body-size: "512m"
-#     nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
-#     nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
-#     nginx.ingress.kubernetes.io/proxy-buffering: "off"
 # spec:
-#   ingressClassName: nginx
-#   tls:
-#     - hosts: ["agents.example.com"]
-#       secretName: agents-anywhere-tls
+#   parentRefs:
+#     - name: istio-gateway
+#       namespace: istio-system
+#       sectionName: http
+#     - name: istio-gateway
+#       namespace: istio-system
+#       sectionName: https
+#   hostnames:
+#     - agents.example.com
 #   rules:
-#     - host: agents.example.com
-#       http:
-#         paths:
-#           - path: /
-#             pathType: Prefix
-#             backend:
-#               service:
-#                 name: server
-#                 port:
-#                   number: 8000
+#     - matches:
+#         - path:
+#             type: PathPrefix
+#             value: /
+#       backendRefs:
+#         - name: server
+#           port: 8000
+#       # 流式推送 / WebSocket 不被超时掐断（0s = 关闭）
+#       timeouts:
+#         request: 0s
+#         backendRequest: 0s
