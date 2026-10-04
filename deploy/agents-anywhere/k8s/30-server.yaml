@@ -101,6 +101,7 @@ spec:
                   key: postgres-password
             # 与下面容器同一套拼法（kubectl 会展开同容器内先定义的 $(POSTGRES_PASSWORD)）。
             # 主机名 postgres 同上：由 10-postgres.yaml 的 ExternalName Service 指向外部库。
+            # ⚠️ 驱动名别改：写成 postgresql:// 或 +psycopg 会报 No module named 'psycopg'。
             - name: AGENT_SERVER_DB_URL
               value: postgresql+asyncpg://agents_anywhere:$(POSTGRES_PASSWORD)@postgres:5432/agents_anywhere
             - name: AGENT_SERVER_MIGRATION_LOCK_TIMEOUT
@@ -116,6 +117,8 @@ spec:
               value: postgres
             # 密码单独取一次，再由 kubectl 展开进 URL（避免同一份密码存两处、日后漂移）。
             # 主机名 postgres 由 10-postgres.yaml 的 ExternalName Service 指到你的外部库。
+            # ⚠️ 驱动名别改：镜像里只装了 asyncpg —— 写成 postgresql:// 或 postgresql+psycopg://
+            #    会在迁移阶段报 `ModuleNotFoundError: No module named 'psycopg'`（见 README 常见坑）。
             - name: POSTGRES_PASSWORD
               valueFrom:
                 secretKeyRef:

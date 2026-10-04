@@ -80,7 +80,7 @@ kubectl -n agents-anywhere rollout status deploy/server     # 只有 server 需�
 | `10-postgres.yaml` | 最后的 `Service` 里 `externalName: pg.example.com` | 你的 PostgreSQL 主机名（**域名**） |
 | `20-redis.yaml` | 最后的 `Service` 里 `externalName: redis.example.com` | 你的 Redis 主机名（**域名**） |
 
-四条硬约束（ExternalName 的语义，不是取舍）：
+五条硬约束（前四条是 ExternalName 的语义，第五条是镜像里的依赖，都不是取舍）：
 
 1. **只能填域名**：ExternalName 就是一条 DNS CNAME，填 IP 不生效。外部库只有 IP 的话别用它，
    直接把 `30-server.yaml` 里 `AGENT_SERVER_DB_URL` / `AGENT_SERVER_REDIS_URL` 的
@@ -91,6 +91,9 @@ kubectl -n agents-anywhere rollout status deploy/server     # 只有 server 需�
    数据库流量默认是明文。
 4. **外部 Redis 也得是那一套**：AOF（`appendfsync everysec`）+ `noeviction` + 持久盘 ——
    它扛着「已接受但还没落库的 Timeline 写入」与序号头，不是纯缓存。
+5. **改 DSN 时保留 `+asyncpg`**：`AGENT_SERVER_DB_URL` 必须写成 `postgresql+asyncpg://…` —— 镜像里只装了
+   `asyncpg`，写成 `postgresql://` 或 `postgresql+psycopg://` 会在迁移阶段报
+   `ModuleNotFoundError: No module named 'psycopg'`（详见「常见坑」）。
 
 迁移照样跑：`migrate` init 容器每次启动都对**外部库**执行 `migrations upgrade`（幂等）。
 外部库暂时连不上时表现为：init 容器失败并按退避重试、服务起来后 readiness 报 503
@@ -313,6 +316,7 @@ Pod 从此可以调度到任意节点。
 | 现象 | 原因 |
 |---|---|
 | `server` 的 `migrate` init 容器失败 / `Init:CrashLoopBackOff` | 先看它自己的日志：`kubectl -n agents-anywhere logs deploy/server -c migrate`。三种典型：解析不出 `postgres`（那两个 ExternalName Service 没 apply，或 `externalName` 写错）、连接被拒（外部库没监听 / 防火墙 / 端口不对）、`password authentication failed`（见下面那一行） |
+| `migrate` 日志里 `ModuleNotFoundError: No module named 'psycopg'`（线程名 `postgres-migration-lock`），随后等约 120 秒才失败 | **DB URL 的驱动名写错了**：镜像里只装了 `asyncpg`（上游 `server/pyproject.toml` 的依赖表里没有 psycopg / psycopg2），必须显式写 **`postgresql+asyncpg://…`**。镜像内实测（SQLAlchemy 2.1.3）：`+asyncpg` → OK；`+psycopg` **和**不带驱动名的 `postgresql://` 都会报这个错（2.1 起 `postgresql://` 的默认驱动已是 psycopg）；`+psycopg2` 则报 `psycopg2`。改 `30-server.yaml` 里的 URL 后重新 apply |
 | `externalName` 填了 IP，或端口对不上 | ExternalName 是 CNAME：**只能填域名**，填 IP 解析不出来；它也**不做端口转换** —— URL 里写的 5432 / 6379 就是实际拨出去的端口 |
 | Pod `Pending`，事件说 `unbound Immediate PersistentVolumeClaims` | PV/PVC 绑不上：`claimRef.namespace` 写错，或 PV 与 PVC 的 `storageClassName` 不一致（静态供给时两边必须**同时**是空字符串） |
 | Pod `CreateContainerConfigError` | 少了 Secret：`kubectl -n agents-anywhere get secret agents-anywhere-secret`（两个键 `postgres-password` / `agent-server-secret` 都要有），且必须在 apply 之前建好 |
