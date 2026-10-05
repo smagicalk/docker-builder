@@ -1,0 +1,19 @@
+# Paseo Relay 的命名空间。
+#
+# 为什么单独一个：它与 WorkBuddy、Agents-Anywhere 两套完全无关（不共享任何东西），
+# 混在一起只会让 RBAC、配额和「删错东西」的风险变大。
+#
+# 部署顺序：
+#   kubectl apply -f deploy/paseo-relay/k8s/00-namespace.yaml
+#   （建 Secret：RELEASE_COOKIE 的创建命令见 10-relay.yaml 顶部）
+#   kubectl apply -f deploy/paseo-relay/k8s/10-relay.yaml
+#
+# 这套服务**没有任何持久化**（无库、无 Redis、无卷）：状态在节点内存里，
+# 重启就丢（客户端重连即可），所以这里不需要 PV/PVC。
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: paseo-relay
+  labels:
+    app.kubernetes.io/part-of: paseo-relay

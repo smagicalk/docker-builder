@@ -1,0 +1,239 @@
+# Paseo Relay：Elixir/OTP 写的 WebSocket 中继（上游 getpaseo/paseo-relay）。
+#
+# ── 先建 Secret 再 apply（**刻意不放进清单**：放进去每次 apply 都会用占位值覆盖真值）──
+#
+#   kubectl -n paseo-relay create secret generic paseo-relay-secret \
+#     --from-literal=release-cookie="$(openssl rand -base64 48)" \
+#     --dry-run=client -o yaml | kubectl apply -f -
+#
+#   RELEASE_COOKIE 是 Erlang 集群的共享密钥：**各副本必须完全一致**，否则节点之间
+#   根本连不上（表现是 /ready 一直 503、日志里没有对端 nodeup）。
+#   单副本也照样要它 —— 省得以后扩副本时才发现不一致。
+#
+# ── 这个部署的形态（都与上游契约对齐，见 ../README.md「组网契约」）────────
+#   · 无任何持久化：没有库 / Redis / 卷，状态在节点内存里，重启即丢（客户端重连）；
+#   · 默认 **1 副本**：中继的「归属」是每节点内存里的，跨节点要靠部署方的代理把
+#     WebSocket 升级请求重放到 owner（非 owner 返回 409 + reroute 头）。
+#     k8s 里**没有**现成的这种适配器，所以默认单副本；扩副本前先看 README 那一节；
+#   · 组网变量仍然全留着（RELEASE_NODE / COOKIE / CLUSTER_QUERY / OWNERSHIP_TARGET），
+#     单副本时它们是无害的，扩副本时只需要改 replicas 与 MIN_CLUSTER_SIZE。
+
+---
+# 给「节点发现」用的 headless Service：DNSCluster 查这个名字，拿到**所有 Pod IP**，
+# 于是各节点用 paseo_relay@<pod-ip> 互相连上（本地用两个容器 + 共享 DNS 别名实测过）。
+#
+# ⚠️ publishNotReadyAddresses: true 是**必须**的：Pod 未 Ready 时默认会从 DNS 里摘掉，
+#    而「Ready」本身又要求达到 cluster floor（PASEO_RELAY_MIN_CLUSTER_SIZE）——
+#    两副本同时启动时就会互相看不到、谁都到不了 floor，形成死锁。
+apiVersion: v1
+kind: Service
+metadata:
+  name: paseo-relay-headless
+  namespace: paseo-relay
+  labels:
+    app.kubernetes.io/name: paseo-relay
+    app.kubernetes.io/part-of: paseo-relay
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: paseo-relay
+  ports:
+    - name: relay
+      port: 4000
+      targetPort: relay
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: paseo-relay
+  namespace: paseo-relay
+  labels:
+    app.kubernetes.io/name: paseo-relay
+    app.kubernetes.io/part-of: paseo-relay
+spec:
+  # 默认 1 副本（见文件开头）。要扩副本：改这里 + 把下面的
+  # PASEO_RELAY_MIN_CLUSTER_SIZE 一起改大，并先解决跨节点 reroute（README 有说明）。
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # 多副本时一次只换一个，避免集群 floor 被瞬间打穿（单副本无所谓）。
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: paseo-relay
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: paseo-relay
+        app.kubernetes.io/part-of: paseo-relay
+    spec:
+      # 与上游 Fly 的 kill_timeout = 30s 对齐：给它时间把在途帧发完 / 关掉连接。
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: relay
+          image: ghcr.io/smagicalk/paseo-relay:latest
+          # 镜像由本仓库 CI 构建、标签是 latest：必须每次拉取，否则节点上会一直复用旧镜像。
+          imagePullPolicy: Always
+          env:
+            # ── 本实例是谁（必须先定义，下面用 $(VAR) 展开）──────────────
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # ── 监听 ──────────────────────────────────────────────────
+            - name: PASEO_RELAY_HOST
+              value: 0.0.0.0
+            - name: PASEO_RELAY_PORT
+              value: "4000"
+            # ── 组网（Erlang 分布 + DNS 发现）──────────────────────────
+            # 长节点名，且每个实例必须唯一 —— 上游的 Fly 适配层同样是
+            # RELEASE_NODE=paseo_relay@${实例私有 IP}，这里用 Pod IP（同一套契约）。
+            - name: RELEASE_DISTRIBUTION
+              value: name
+            - name: RELEASE_NODE
+              value: paseo_relay@$(POD_IP)
+            # 集群共享密钥，来自 Secret（各副本必须一致，否则组不起来）。
+            - name: RELEASE_COOKIE
+              valueFrom:
+                secretKeyRef:
+                  name: paseo-relay-secret
+                  key: release-cookie
+            # 用 headless Service 的 FQDN 做节点发现：它会解析出**所有** Pod IP。
+            - name: PASEO_RELAY_CLUSTER_QUERY
+              value: paseo-relay-headless.paseo-relay.svc.cluster.local
+            # 低于这个节点数就报 not-ready（/ready 返回 503）。
+            # 单副本必须是 1；扩到 N 副本就改成 N（或你要的下限）。
+            - name: PASEO_RELAY_MIN_CLUSTER_SIZE
+              value: "1"
+            # 本实例对外公布的「我是谁」（不透明字符串，给 reroute 用）。
+            # 用 Pod 名：将来做 reroute 适配器时，这个名字在 headless Service 里正好
+            # 能解析成 Pod IP，方便把请求重放到 owner。
+            - name: PASEO_RELAY_OWNERSHIP_TARGET
+              value: instance=$(POD_NAME)
+            # ── 运行时小修 ────────────────────────────────────────────
+            # 镜像的运行时基础层没设 locale，不设这两项启动时会警告 latin1
+            # （上游 Fly 适配层也设了 ELIXIR_ERL_OPTIONS=+fnu）。
+            - name: LANG
+              value: C.UTF-8
+            - name: ELIXIR_ERL_OPTIONS
+              value: +fnu
+          ports:
+            - name: relay
+              containerPort: 4000
+          # 上游语义：/health 只证明 HTTP 进程活着；/ready 才是「能不能接新活」
+          # （draining、低于 cluster floor、容量/内存压力时返回 503）。
+          # 所以 liveness 用 /health，readiness 用 /ready —— 反过来会变成重启风暴。
+          startupProbe:
+            httpGet:
+              path: /health
+              port: relay
+            periodSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: relay
+            periodSeconds: 10
+            # /ready 内部有自己的状态窗口（上游按秒描述），给 3 秒余量。
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: relay
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              # 先把 Pod 标成 Terminating（客户端端点被摘掉），再让它优雅收尾。
+              exec:
+                command: ["sh", "-c", "sleep 5"]
+          # 与上游 Fly 的机型对齐（1 性能核 / 2GB）；默认上限是每节点 2 万条 WebSocket
+          # （100 acceptors × 200 connections_per_acceptor），内存随流量涨，按需调大。
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 2Gi
+          securityContext:
+            # 镜像以 root 运行（上游 Dockerfile 没有 USER），但不需要任何提权：
+            # 监听 4000、在 /app 下读写自己的文件而已。
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+
+---
+# 客户端 / 网关用的入口（headless 那个不对外）。
+apiVersion: v1
+kind: Service
+metadata:
+  name: paseo-relay
+  namespace: paseo-relay
+  labels:
+    app.kubernetes.io/name: paseo-relay
+    app.kubernetes.io/part-of: paseo-relay
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: paseo-relay
+  ports:
+    - name: relay
+      port: 4000
+      targetPort: relay
+
+---
+# ── 对外暴露：Gateway API（HTTPRoute）示例（可选；公网使用必配 TLS）──────────
+# 用你集群里现成的 Gateway（示例是 istio-system 里的 istio-gateway）。
+# 后端是上面的 Service `paseo-relay`（4000）。
+#
+# 三点注意：
+#   1. TLS 在**网关的 listener** 上（parentRefs 里 https 那一段），HTTPRoute 里不用写 tls。
+#   2. **必须关超时**：这是 WebSocket 长连接，网关的默认超时（Envoy 的 route timeout 默认
+#      15 秒）会把连接掐断 —— 示例按规范把 timeouts.request / backendRequest 设成 0s
+#      （规范原文：zero duration（"0s"）SHOULD disable the timeout completely）。
+#   3. 跨命名空间挂载要网关允许：本路由在 paseo-relay、网关在 istio-system，需要网关
+#      listener 的 allowedRoutes.namespaces.from 允许，否则路由会被**静默忽略**
+#      （kubectl get httproute -n paseo-relay 看 Accepted / ResolvedRefs）。
+#
+# ⚠️ 多副本时还有第 4 点：非 owner 节点会对升级请求返回 **409** + reroute 头
+#    （默认 x-reroute-target，Fly 适配层用 fly-replay），要由**部署方的代理**把请求
+#    重放到 owner。k8s 里没有现成适配器 —— 详见 ../README.md「单副本 vs 多副本」。
+#
+# apiVersion: gateway.networking.k8s.io/v1
+# kind: HTTPRoute
+# metadata:
+#   name: paseo-relay
+#   namespace: paseo-relay
+# spec:
+#   parentRefs:
+#     - name: istio-gateway
+#       namespace: istio-system
+#       sectionName: http
+#     - name: istio-gateway
+#       namespace: istio-system
+#       sectionName: https
+#   hostnames:
+#     - relay.example.com
+#   rules:
+#     - matches:
+#         - path:
+#             type: PathPrefix
+#             value: /
+#       backendRefs:
+#         - name: paseo-relay
+#           port: 4000
+#       # WebSocket 长连接不被超时掐断（0s = 关闭）
+#       timeouts:
+#         request: 0s
+#         backendRequest: 0s

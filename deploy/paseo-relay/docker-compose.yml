@@ -1,0 +1,49 @@
+# 用「预构建镜像」跑 Paseo Relay（**单节点**）。镜像由本仓库 CI 构建：
+#   ghcr.io/smagicalk/paseo-relay:latest（跟上游 main 分支 HEAD，见仓库根 README）
+#
+# 这个服务**没有任何外部依赖**：没有数据库、没有 Redis、没有卷 —— 状态在节点内存里
+# （`syn` 做进程注册表），重启即丢，客户端重连即可。单节点也就不需要任何组网变量。
+#
+# 起法：
+#   docker compose -f deploy/paseo-relay/docker-compose.yml up -d
+#   curl -s http://127.0.0.1:4000/ready      # {"status":"ready"}
+#
+# 生产：把 4000 放到 HTTPS 反代 / 网关后面。**WebSocket 是长连接**，网关别设请求超时
+# （否则连接会被掐断）；多节点部署看 k8s/README.md 的「单副本 vs 多副本」。
+
+name: paseo-relay
+
+services:
+  relay:
+    image: ghcr.io/smagicalk/paseo-relay:latest
+    restart: unless-stopped
+    environment:
+      PASEO_RELAY_HOST: 0.0.0.0
+      PASEO_RELAY_PORT: "4000"
+      # 单节点：集群下限就是 1。不设 PASEO_RELAY_CLUSTER_QUERY = 不做节点发现。
+      PASEO_RELAY_MIN_CLUSTER_SIZE: "1"
+      # 本实例对外公布的「我是谁」（不透明字符串，给跨节点 reroute 用）。
+      # 单节点随便填，但填上以后扩节点时语义一致。
+      PASEO_RELAY_OWNERSHIP_TARGET: instance-compose-1
+      # 镜像的运行时基础层没设 locale：不设这两项启动时会警告 latin1。
+      LANG: C.UTF-8
+      ELIXIR_ERL_OPTIONS: +fnu
+    ports:
+      # 默认只绑本机：生产要放在 HTTPS 反代 / 网关后面。
+      - "127.0.0.1:4000:4000"
+    # 上游 Fly 适配层就是这么设的（entrypoint 里 ulimit -n 100000）：
+    # 每条 WebSocket 占一个 socket，默认 fd 上限（1024）根本不够。
+    ulimits:
+      nofile:
+        soft: 100000
+        hard: 100000
+    # 与上游 Fly 的 kill_timeout = 30s 对齐：给它时间把在途帧发完 / 关掉连接。
+    stop_grace_period: 30s
+    healthcheck:
+      # 镜像里没有 curl / wget，用 bash 的 /dev/tcp 发一个 HTTP 请求（bash 在 debian-slim 里有）。
+      # 判 200 的是 /ready —— 与 K8s 里的 readiness 探针同一个端点。
+      test: ["CMD", "bash", "-c", 'exec 3<>/dev/tcp/127.0.0.1/4000; printf "GET /ready HTTP/1.0\r\nHost: localhost\r\n\r\n" >&3; head -1 <&3 | grep -q 200']
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 15s

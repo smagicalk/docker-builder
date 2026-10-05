@@ -191,8 +191,8 @@ docker pull ghcr.io/<owner>/paseo-relay:latest
 
 ## 部署与运行（都在 `deploy/` 下）
 
-本仓库只管**打包上游镜像**；怎么把它跑起来，都在 `deploy/` 下按项目分文件夹 —— 两个项目各一套、
-彼此无关（不同的库、不同的密钥，各用一个命名空间就好），每份都能独立看：
+本仓库只管**打包上游镜像**；怎么把它跑起来，都在 `deploy/` 下按项目分文件夹 —— 三个项目各一套、
+彼此无关（各自的命名空间与凭据，互不影响），每份都能独立看：
 
 | 目录 | 内容 |
 |---|---|
@@ -202,6 +202,8 @@ docker pull ghcr.io/<owner>/paseo-relay:latest
 | [`deploy/workbuddy/k8s/`](deploy/workbuddy/k8s/README.md) | Kubernetes：上游 + 面板**同一个 Pod** 的完整清单（4 PV/PVC、init 容器、2 Service、注释版 Ingress）与全部坑位 |
 | [`deploy/agents-anywhere/`](deploy/agents-anywhere/README.md) | **Agents-Anywhere 总览**：上游服务端 + PostgreSQL 17 + Redis 8，`docker-compose.yml` 与 `k8s/` 两种跑法 |
 | [`deploy/agents-anywhere/k8s/`](deploy/agents-anywhere/k8s/README.md) | Kubernetes：Postgres + Redis + Server 的完整清单（3 PV/PVC、迁移用的 init 容器、注释版 Ingress）与全部坑位 |
+| [`deploy/paseo-relay/`](deploy/paseo-relay/README.md) | **Paseo Relay 总览**：Elixir/OTP 写的 WebSocket 中继（无外部依赖），`docker-compose.yml` 与 `k8s/` 两种跑法 |
+| [`deploy/paseo-relay/k8s/`](deploy/paseo-relay/k8s/README.md) | Kubernetes：headless Service（节点发现）+ Deployment + Service + 注释版 HTTPRoute；含组网契约、容量参数与「单副本 vs 多副本」 |
 
 **WorkBuddy** 三者的关系一句话：上游镜像由**本仓库**构建 →
 [`workbuddy2api/`](deploy/workbuddy/workbuddy2api/README.md) 讲怎么单独跑它 →
@@ -214,9 +216,16 @@ docker pull ghcr.io/<owner>/paseo-relay:latest
 [`deploy/agents-anywhere/k8s/README.md`](deploy/agents-anywhere/k8s/README.md) 走 —— 里面写了
 **空库首次的引导 token 怎么取**、升级时的停机窗口、以及扩 worker 的前提。
 
+**Paseo Relay** 最简单：Elixir/OTP 写的 WebSocket 中继，**没有库、没有 Redis、没有卷**（状态在节点
+内存里），所以 compose 就是一个容器；K8s 那份清单见
+[`deploy/paseo-relay/k8s/README.md`](deploy/paseo-relay/k8s/README.md) —— 重点在**节点发现**
+（headless Service + `RELEASE_NODE` / `RELEASE_COOKIE`）与「单副本 vs 多副本」（跨节点要靠网关重放
+409，k8s 里没有现成适配器，所以默认单副本）。
+
 > 只想在单机上跑（不碰 Kubernetes）：WorkBuddy 看它的前两个文件夹就够 —— 上游一个 compose，
 > 面板一个官方 compose（或 `docker run`），两者用同一个 Docker 网络互通；
-> Agents-Anywhere 同理，`deploy/agents-anywhere/docker-compose.yml` 一条命令起全套。
+> Agents-Anywhere 同理，`deploy/agents-anywhere/docker-compose.yml` 一条命令起全套；
+> Paseo Relay 更省事 —— 它连外部依赖都没有，`deploy/paseo-relay/docker-compose.yml` 起一个容器就完事。
 
 ## 注意
 
