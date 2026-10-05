@@ -112,6 +112,12 @@ jobs:
           mkdir -p build-context
           cp -a release/. build-context/
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Build and publish combined image
         if: steps.check.outputs.need_build == '1'
         uses: docker/build-push-action@v6
