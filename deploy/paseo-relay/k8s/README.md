@@ -75,9 +75,10 @@ kubectl -n paseo-relay exec deploy/paseo-relay -- \
 
 单副本已经能吃到一台机器的默认上限（每节点 2 万条 WebSocket）。要横向扩，**按这个顺序**：
 
-1. **先解决跨节点 reroute**（见 [`../README.md`](../README.md) 的「单副本 vs 多副本」）：非 owner 节点
-   会对 WebSocket 升级请求返回 **`409`** + reroute 头（默认 `x-reroute-target`），需要**你的网关**读那个头
-   再把升级请求重放到 owner。k8s 里没有现成适配器 —— 没解决就扩副本，客户端会间歇性收到 409。
+1. **先解决跨节点 reroute**（见 [`../README.md`](../README.md) 的「单副本 vs 多副本」）：非 owner 节点会对
+   WebSocket 升级请求返回 **`409`** + reroute 头（默认 `x-reroute-target: instance=<Pod 名>`），需要**你的
+   网关**读那个头再把升级请求重放到 owner。**注意只有「重连」会撞上**（全新会话任何节点都能认领）；
+   判断依据是 `/metrics` 的 `paseo_relay_reroute_responses_total` 有没有增长。
 2. 改 `10-relay.yaml` 的 `replicas`，**同时**把 `PASEO_RELAY_MIN_CLUSTER_SIZE` 改大（一般填副本数）。
 3. 观察组网：
    ```bash
@@ -108,7 +109,7 @@ kubectl -n paseo-relay exec deploy/paseo-relay -- \
 | 现象 | 原因 |
 |---|---|
 | `/ready` 一直 `503 {"status":"unready"}` | 三种：① 没到 cluster floor（`PASEO_RELAY_MIN_CLUSTER_SIZE` 比实际节点数大）；② `RELEASE_COOKIE` 各副本不一致；③ headless Service 解析不到对端。先看日志有没有对端 `nodeup`，再用上面那条 `getent hosts` 验 DNS |
-| 客户端**间歇性**收到 `409` | 多副本但没做 reroute 适配器（非 owner 节点就是这么答的）。要么回到单副本，要么在网关层实现重放 —— 见「扩容」第 1 步 |
+| 客户端**重连**时收到 `409` | 该会话的 owner 在别的节点（多副本 + 没做 reroute 重放）。**全新会话不会**这样（任何节点都能认领）。判断：`/metrics` 的 `paseo_relay_reroute_responses_total` 是否增长。要么回单副本，要么按「扩容」第 1 步做重放 —— 细节见 [`../README.md`](../README.md) |
 | Pod 一直 `0/1`，但 `/health` 明明是 200 | **正常**：`/health` 只证明进程活着，就绪看 `/ready`（见上一条） |
 | 连接建立几十秒后被断开 | 网关/反代设了请求超时。HTTPRoute 里给 `timeouts: {request: 0s, backendRequest: 0s}`（或网关侧关掉），WebSocket 是长连接 |
 | 滚动更新/删 Pod 时客户端集体掉线 | 预期（内存态归属随 Pod 消失），客户端会自动重连；想更平滑就调大 `terminationGracePeriodSeconds`，多副本时靠 `maxUnavailable: 0` 保住 floor |

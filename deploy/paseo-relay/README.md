@@ -57,16 +57,37 @@ curl -s http://127.0.0.1:4000/ready      # {"status":"ready"}
 
 ## 单副本 vs 多副本（重要）
 
-中继的**路由归属**是每节点内存里的（`syn`）：某个 session 的 owner 在哪台，后续连接就必须落到
-那台。非 owner 节点收到 WebSocket 升级请求时会返回 **`409`** + 一个 reroute 头（默认
-`x-reroute-target`，上游的 Fly 适配层用 `fly-replay`），**由部署方的代理把请求重放到 owner**
-（上游原话：*a deployment adapter reroutes WebSocket upgrades to the owning node*）。
+先说结论：**多节点本身没问题，会出问题的只有「重连」**。判定逻辑在 `lib/paseo_relay/ownership.ex`
+与 `socket.ex`，逐条列出来：
 
-- **单副本**：不存在跨节点，永远不会 409 —— 本仓库的 K8s 清单默认就是 `replicas: 1`。
-- **多副本**：K8s 里**没有**现成的这种适配器（Istio / Envoy、ingress-nginx 都不会「读响应头再把
-  升级请求重放到指定实例」）。要么自己在网关层实现（读 409 + 那个头，再重放），要么让客户端能直连
-  owner —— `PASEO_RELAY_OWNERSHIP_TARGET=instance=<Pod 名>` 正好能在 headless Service 里解析成
-  Pod IP，方便你做这件事。没解决就扩副本 = 客户端会间歇性收到 409。
+| 情况 | 行为 |
+|---|---|
+| 该 serverId **还没有 owner**（全新会话） | 任何达到 cluster floor 的节点都**直接认领** → 正常建立 ✓ |
+| owner 就是**本节点** | 正常 ✓ |
+| owner 在**别的节点**（重连，或换 Pod 后落到别台） | 回 **`409`** + reroute 头（默认 `x-reroute-target: instance=<Pod 名>`）—— 需要部署方的代理把这次升级请求**重放**到 owner |
+| owner 所在 Pod 挂了 | `syn` 注册表随之消失 → 该 serverId 回到「无 owner」→ 任何节点都能重新认领 ✓（节点故障是自愈的） |
+
+上游自己就是靠代理重放解决的：Fly 适配层发 `fly-replay: instance=<machine-id>`，由 Fly Proxy 重放
+（README 原话：*a deployment adapter reroutes WebSocket upgrades to the owning node*）。**k8s 里没有
+这种代理** —— 要多副本，这一步得自己补（或依赖客户端重试，见文末那条未验证项）。
+
+### 三个选项
+
+| 选项 | 做法 | 代价 / 风险 |
+|---|---|---|
+| ① **单副本**（本清单默认） | 什么都不用做 | 没有 409；默认每节点 2 万条 WebSocket，多数场景够用 |
+| ② **网关侧重放**（对齐上游） | 读 409 响应里的 `x-reroute-target`，把升级请求重放到那台。`instance=<Pod 名>` 在 headless Service 里正好能解析成 Pod IP（本清单把 target 设成 Pod 名就是为了这一步） | 要自己实现：Envoy 的 Lua / Wasmer 过滤器，或一个外部处理器 |
+| ③ **让重试概率收敛**（务实降级） | Istio `VirtualService`：`retries: {attempts: 3, retriableStatusCodes: [409]}`（Istio 的重试会换 host） | 不是协议级保证，只是概率收敛；每次重试多一次往返。⚠️ k8s Service 的 `sessionAffinity: ClientIP` 在这里**无效**（流量由网关的 Envoy 直接负载均衡，不经过 kube-proxy）；要按源 IP 亲和得用 Istio `DestinationRule` 的 `consistentHash: {useSourceIp: true}` |
+
+### 怎么判断有没有踩到
+
+`/metrics` 里有 **`paseo_relay_reroute_responses_total`** —— 每次返回 409 都会 +1。扩副本后盯它：
+**一直为 0** 说明你的客户端/拓扑没触发跨节点重连；**持续增长** 就说明需要 ② 或 ③。
+
+> ⚠️ **两个没验证的点**（别当保证）：① 客户端收到 409 之后会不会自己重试 —— 我读的是中继代码，
+> 没读 Paseo 客户端；会重试的话多副本的 409 只是多一次往返，不会就是硬失败。② 我**没有**在真实
+> k8s 集群里跑过多副本，只在本机两个容器上验证了**组网**本身（`MIN_CLUSTER_SIZE=2` 时两节点
+> `/ready` 都 200、日志出现对端 `nodeup`）。
 
 ## 与上游 Fly 部署的对应关系
 

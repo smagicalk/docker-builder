@@ -53,8 +53,9 @@ metadata:
     app.kubernetes.io/name: paseo-relay
     app.kubernetes.io/part-of: paseo-relay
 spec:
-  # 默认 1 副本（见文件开头）。要扩副本：改这里 + 把下面的
-  # PASEO_RELAY_MIN_CLUSTER_SIZE 一起改大，并先解决跨节点 reroute（README 有说明）。
+  # 默认 1 副本（见文件开头）。扩副本：改这里 + 把下面的 PASEO_RELAY_MIN_CLUSTER_SIZE 一起改大。
+  # ⚠️ 多副本下**只有「重连」**可能落到非 owner（→ 409 + reroute 头，需网关重放；全新会话不受影响）。
+  #    判断依据：/metrics 的 paseo_relay_reroute_responses_total —— 详见 ../README.md「单副本 vs 多副本」。
   replicas: 1
   strategy:
     type: RollingUpdate
