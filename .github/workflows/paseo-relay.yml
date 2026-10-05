@@ -1,0 +1,266 @@
+# paseo-relay（getpaseo/paseo-relay）镜像：上游**只发 main、不发 release/tag**，
+# 所以直接跟 main 分支的 HEAD 走 —— 每次定时看一眼 HEAD 提交有没有变，变了才构建。
+#
+# 与另两条流水线的差别（同一个骨架，判断依据不同）：
+#   · 判断依据是 **main 分支 HEAD 的提交**（`sha-<前12位>` 内容寻址标签），不是附件摘要、
+#     也不是 release tag —— 上游一个 release / tag 都没有，只有分支；
+#   · 构建上下文是**整个上游仓库**（根目录 Dockerfile 要 `COPY mix.exs mix.lock config lib`）；
+#   · 两个架构都出（amd64 + arm64）：Elixir 的构建是纯 BEAM 编译（无 C 扩展），
+#     在 QEMU 下可以接受；基础镜像 hexpm/elixir 与 debian:bookworm-slim 都是多架构的；
+#   · 上游有 LICENSE（Apache-2.0），所以这里没有 agents-anywhere 那条许可提醒。
+#
+# 触发：
+#   · schedule          每 6 小时看一次 main 的 HEAD（变了才构建）
+#   · workflow_dispatch 手动：可 `force` 强制重建
+#   · push              本文件变化时（首次推上来会立刻构建一份，省得等定时）
+
+name: paseo-relay
+
+on:
+  schedule:
+    # 每 6 小时一次（UTC）。cron 用非整点分钟，且与另两条流水线错开（它们用 17）。
+    - cron: '37 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '忽略「已是最新」判断，强制重新构建推送'
+        type: boolean
+        default: false
+  push:
+    # 只认本文件的变化：之后改 README 不会白白跑一次十几分钟的构建。
+    paths:
+      - '.github/workflows/paseo-relay.yml'
+
+# 两次运行不互相打断（排队，不取消）：否则并发构建同一批标签时 latest 指向谁不好说。
+concurrency:
+  group: paseo-relay
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  # 推镜像到 GHCR 必须显式声明；只有 contents 会被拒。
+  packages: write
+
+env:
+  UPSTREAM_REPO: getpaseo/paseo-relay
+  UPSTREAM_BRANCH: main
+  UPSTREAM_DOCKERFILE: Dockerfile
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # push 触发时只在默认分支上真跑，避免 feature 分支把 latest 覆盖掉。
+    if: github.event_name != 'push' || github.ref_name == github.event.repository.default_branch
+    steps:
+      - name: 解析镜像名
+        id: image
+        env:
+          # 仓库所有者自动带上（谁 fork 就推谁名下）；未设这个变量时用默认名。
+          IMAGE_NAME: ${{ vars.PASEO_RELAY_IMAGE_NAME || 'paseo-relay' }}
+        run: |
+          set -euo pipefail
+          # GHCR 要求镜像名全小写，用户名可能含大写字母，所以强制转小写。
+          GHCR="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${IMAGE_NAME,,}"
+          echo "ghcr=${GHCR}" >> "$GITHUB_OUTPUT"
+          echo "镜像名：${GHCR}"
+
+      - name: 解析 main 的 HEAD
+        id: head
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          API="https://api.github.com/repos/${UPSTREAM_REPO}"
+
+          # 优先带 token 请求（额度高）；token 对别的仓库不适用时退回匿名。
+          fetch() {
+            local url="$1"
+            if [ -n "${GH_TOKEN:-}" ]; then
+              curl -fsSL -H "Accept: application/vnd.github+json" \
+                -H "Authorization: Bearer ${GH_TOKEN}" "$url" && return 0
+            fi
+            curl -fsSL -H "Accept: application/vnd.github+json" "$url"
+          }
+
+          COMMIT_JSON="$(fetch "${API}/commits/${UPSTREAM_BRANCH}")" \
+            || { echo "::error::拉取 ${UPSTREAM_BRANCH} 的 HEAD 失败"; exit 1; }
+
+          SHA="$(printf '%s' "$COMMIT_JSON" | jq -r '.sha // empty')"
+          [ -n "$SHA" ] || { echo "::error::HEAD 里没有 sha"; exit 1; }
+          DATE="$(printf '%s' "$COMMIT_JSON" | jq -r '.commit.committer.date // empty')"
+          MSG="$(printf '%s' "$COMMIT_JSON" | jq -r '.commit.message // ""' | head -n 1)"
+          HTML="$(printf '%s' "$COMMIT_JSON" | jq -r '.html_url // empty')"
+
+          {
+            echo "sha=${SHA}"
+            echo "short=${SHA:0:12}"
+            echo "date=${DATE}"
+            echo "msg=${MSG}"
+            echo "html=${HTML}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "main HEAD：${SHA}"
+          echo "提交时间：${DATE}"
+          echo "提交信息：${MSG}"
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 判断是否需要构建
+        id: check
+        env:
+          IMAGE: ${{ steps.image.outputs.ghcr }}
+          SHORT: ${{ steps.head.outputs.short }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          # 用「提交前 12 位」的内容寻址标签作为已构建依据：main 被强推/回滚也能认出来。
+          PROBE="sha-${SHORT}"
+          echo "probe_tag=${PROBE}" >> "$GITHUB_OUTPUT"
+
+          if [ "${FORCE}" = "true" ]; then
+            echo "手动要求强制重建"
+            echo "need_build=1" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if docker buildx imagetools inspect "${IMAGE}:${PROBE}" >/dev/null 2>&1; then
+            echo "main 的 HEAD 未变化：${IMAGE}:${PROBE} 已存在，跳过构建"
+            echo "need_build=0" >> "$GITHUB_OUTPUT"
+          else
+            echo "检测到新的 HEAD（${PROBE} 尚不存在），开始构建"
+            echo "need_build=1" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 下载 main 的源码
+        if: steps.check.outputs.need_build == '1'
+        id: fetch
+        env:
+          BRANCH: ${{ env.UPSTREAM_BRANCH }}
+        run: |
+          set -euo pipefail
+          # 按分支取源码 tarball（codeload 不需要 token）。构建上下文必须是**仓库根**，
+          # 因为根目录 Dockerfile 里 COPY 的是 mix.exs / mix.lock / config / lib。
+          URL="https://codeload.github.com/${UPSTREAM_REPO}/tar.gz/refs/heads/${BRANCH}"
+          curl -fsSL --retry 3 --retry-delay 5 -o upstream-src.tgz "$URL"
+
+          mkdir -p src
+          tar -xzf upstream-src.tgz -C src --strip-components=1
+          [ -f "src/${UPSTREAM_DOCKERFILE}" ] \
+            || { echo "::error::${BRANCH} 的源码里没有 ${UPSTREAM_DOCKERFILE}，无法构建"; exit 1; }
+          [ -f src/mix.exs ] \
+            || { echo "::error::缺少 mix.exs（Dockerfile 要 mix deps.get / compile / release）"; exit 1; }
+          [ -f src/mix.lock ] \
+            || { echo "::error::缺少 mix.lock（没有锁文件构建不可复现）"; exit 1; }
+          echo "源码大小：$(du -sh src | cut -f1)"
+
+      - name: 解析标签
+        if: steps.check.outputs.need_build == '1'
+        id: tags
+        env:
+          GHCR: ${{ steps.image.outputs.ghcr }}
+          BRANCH: ${{ env.UPSTREAM_BRANCH }}
+          PROBE: ${{ steps.check.outputs.probe_tag }}
+        run: |
+          set -euo pipefail
+          # 上游没有 release/tag，所以标签只有三种含义：
+          #   latest / main  → 移动标签，始终指 main 的最新构建
+          #   sha-<前12位>   → 内容寻址，判断「要不要重建」就靠它
+          TAGS="$(printf '%s\n' "${GHCR}:latest" "${GHCR}:${BRANCH}" "${GHCR}:${PROBE}")"
+          {
+            echo "tags<<__TAGS__"
+            printf '%s\n' "$TAGS"
+            echo "__TAGS__"
+          } >> "$GITHUB_OUTPUT"
+          echo "本次将推送："
+          printf '%s\n' "$TAGS" | sed 's/^/  /'
+
+      - name: 设置 Buildx
+        if: steps.check.outputs.need_build == '1'
+        uses: docker/setup-buildx-action@v3
+
+      - name: 构建并推送（linux/amd64 + linux/arm64）
+        if: steps.check.outputs.need_build == '1'
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ./src
+          # 上游自带的根目录 Dockerfile：多阶段（hexpm/elixir 里 mix release → debian-slim 运行），
+          # 监听 4000，暴露 /metrics，入口 /app/bin/paseo_relay start。
+          file: ./src/Dockerfile
+          # 两个架构都出：Elixir 是纯 BEAM 编译（无 C 扩展），QEMU 下可接受；
+          # 上游两个基础镜像（hexpm/elixir、debian:bookworm-slim）都是多架构的。
+          platforms: linux/amd64,linux/arm64
+          push: true
+          labels: |
+            org.opencontainers.image.title=paseo-relay
+            org.opencontainers.image.description=paseo-relay（上游源码打包，非官方镜像；Apache-2.0）
+            org.opencontainers.image.source=https://github.com/${{ env.UPSTREAM_REPO }}
+            org.opencontainers.image.revision=${{ steps.head.outputs.sha }}
+            org.opencontainers.image.version=${{ steps.head.outputs.short }}
+            org.paseo-relay.upstream.repo=${{ env.UPSTREAM_REPO }}
+            org.paseo-relay.upstream.branch=${{ env.UPSTREAM_BRANCH }}
+            org.paseo-relay.upstream.commit=${{ steps.head.outputs.sha }}
+            org.paseo-relay.upstream.license=Apache-2.0
+            org.paseo-relay.built-by=github.com/${{ github.repository }}
+          tags: ${{ steps.tags.outputs.tags }}
+          # 关掉证明：它会在 manifest 里塞进 attestation 条目，个别旧版 Docker 拉取时报
+          # unknown/unknown platform。要溯源就跑 `docker buildx imagetools inspect`。
+          provenance: false
+          # 复用上一次的层缓存（mix deps.get / compile 那几层没变就不用重来）。scope 与另两条错开。
+          cache-from: type=gha,scope=paseo-relay
+          cache-to: type=gha,mode=max,scope=paseo-relay
+
+      - name: 输出结果
+        if: steps.check.outputs.need_build == '1'
+        env:
+          GHCR: ${{ steps.image.outputs.ghcr }}
+          BRANCH: ${{ env.UPSTREAM_BRANCH }}
+          SHA: ${{ steps.head.outputs.sha }}
+          PROBE: ${{ steps.check.outputs.probe_tag }}
+          HTML: ${{ steps.head.outputs.html }}
+          MSG: ${{ steps.head.outputs.msg }}
+        run: |
+          {
+            echo "## paseo-relay 镜像已推送"
+            echo ""
+            echo "上游 ${BRANCH} HEAD：\`${SHA}\`"
+            echo ""
+            echo "> ${MSG}"
+            echo ""
+            echo "拉取（可直接复制）："
+            echo ""
+            echo '```bash'
+            echo "docker pull ${GHCR}:latest"
+            echo '```'
+            echo ""
+            echo "标签："
+            echo ""
+            echo '```'
+            echo "${GHCR}:latest        # 移动标签：main 的最新构建"
+            echo "${GHCR}:${BRANCH}            # 同上，语义上跟分支对齐"
+            echo "${GHCR}:${PROBE}    # 内容寻址（HEAD 提交前 12 位）"
+            echo '```'
+            echo ""
+            echo "平台：linux/amd64 + linux/arm64"
+            echo ""
+            echo "运行：监听 4000，\`PASEO_RELAY_HOST/PORT/DRAIN\` 可覆盖，\`/metrics\` 是 Prometheus 指标"
+            echo "（详细参数见上游 OPERATIONS.md）。"
+            echo ""
+            echo "上游提交：${HTML}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 无变化时的小结
+        if: steps.check.outputs.need_build != '1'
+        run: |
+          {
+            echo "## main 的 HEAD 没变，已跳过构建"
+            echo ""
+            echo "当前镜像已对应提交 \`${{ steps.head.outputs.sha }}\`"
+            echo "（探测标签 \`${{ steps.check.outputs.probe_tag }}\`）。"
+            echo ""
+            echo "想强制重建：Actions → paseo-relay → Run workflow，勾上 force。"
+          } >> "$GITHUB_STEP_SUMMARY"

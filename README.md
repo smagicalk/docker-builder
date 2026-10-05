@@ -1,17 +1,19 @@
 # 上游镜像自动打包
 
-把**没有官方镜像**的上游项目：定时检查更新 → 自动构建 → 推送 Docker 镜像。目前打了两个：
+把**没有官方镜像**的上游项目：定时检查更新 → 自动构建 → 推送 Docker 镜像。目前打了三个：
 
 | 镜像 | 上游 | 流水线 | 平台 |
 |---|---|---|---|
 | `ghcr.io/<owner>/workbuddy2api` | [`ithtelab/workbuddy-manager`](https://github.com/ithtelab/workbuddy-manager) 的 Release 附件 [`upstream-src`](https://github.com/ithtelab/workbuddy-manager/releases/tag/upstream-src) | [`workbuddy2api.yml`](.github/workflows/workbuddy2api.yml) | amd64 + arm64 |
 | `ghcr.io/<owner>/agents-anywhere` | [`anywhere-labs/Agents-Anywhere`](https://github.com/anywhere-labs/Agents-Anywhere) 的 GitHub Release | [`agents-anywhere.yml`](.github/workflows/agents-anywhere.yml) | amd64 |
+| `ghcr.io/<owner>/paseo-relay` | [`getpaseo/paseo-relay`](https://github.com/getpaseo/paseo-relay) 的 **main 分支**（上游无 release / tag） | [`paseo-relay.yml`](.github/workflows/paseo-relay.yml) | amd64 + arm64 |
 
 > **本仓库不含任何上游源码。** 源码只在构建时按附件 / release tag 现取，用完即弃。
 > `deploy/` 下是「怎么把这些镜像跑起来」的说明（按项目分文件夹）。
 
 下面**五节**（镜像在哪 / 两种触发方式 / 它怎么工作 / 首次使用 / 配置项）讲的都是
-`workbuddy2api` 那条流水线；`agents-anywhere` 的差异见后面的[同名小节](#agents-anywhere-镜像)。
+`workbuddy2api` 那条流水线；`agents-anywhere` 与 `paseo-relay` 的差异见后面各自的小节
+（[agents-anywhere](#agents-anywhere-镜像) / [paseo-relay](#paseo-relay-镜像)）。
 
 ---
 
@@ -152,6 +154,32 @@ docker pull ghcr.io/<owner>/agents-anywhere:latest
 > ⚠️ **许可**：上游仓库**没有声明 License**（GitHub API 返回 `null`）= 默认「保留所有权利」。
 > 本流水线默认把镜像推到 GHCR（公开仓库默认就是公开包）。要收紧就去
 > Packages → agents-anywhere → Package settings → Change visibility；或先给上游开个 issue 问一句。
+
+## paseo-relay 镜像
+
+上游 [`getpaseo/paseo-relay`](https://github.com/getpaseo/paseo-relay)：Paseo 的分布式中继
+（Elixir/OTP 写的 WebSocket 中继，端口 4000）。**上游只发 main 分支，一个 release / tag 都没有**，
+所以这条流水线直接跟 main 的 HEAD 走。
+
+| 项 | 值 |
+|---|---|
+| 镜像 | `ghcr.io/<owner>/paseo-relay` |
+| 流水线 | [`paseo-relay.yml`](.github/workflows/paseo-relay.yml) |
+| 触发 | 每 6 小时看一次 main 的 HEAD（提交没变就跳过，只花几秒）；也可手动 |
+| 判断依据 | main HEAD 的**提交**（`sha-<前12位>` 内容寻址标签）—— 强推 / 回滚也认得出来 |
+| 标签 | `latest` 与 `main`（都指 main 的最新构建）、`sha-<前12位>` |
+| 平台 | amd64 + arm64（Elixir 是纯 BEAM 编译，QEMU 下可接受；两个基础镜像都是多架构的） |
+| 构建上下文 | main 分支的源码 tarball（整仓库：根目录 `Dockerfile` 要 `COPY mix.exs / mix.lock / config / lib`） |
+| 运行 | 监听 **4000**；`PASEO_RELAY_HOST` / `PASEO_RELAY_PORT` / `PASEO_RELAY_DRAIN` 可覆盖；`/metrics` 是 Prometheus 指标（细节见上游 `OPERATIONS.md`） |
+
+```bash
+docker pull ghcr.io/<owner>/paseo-relay:latest
+```
+
+**手动构建**：Actions → **paseo-relay** → Run workflow —— 勾 `force` 忽略「HEAD 没变」强制重建。
+
+> 上游是 **Apache-2.0**（仓库里有 LICENSE），镜像标签里记了 `upstream.license=Apache-2.0`
+> 与 `upstream.commit`，可以逐字对回是哪个提交打出来的。
 
 ---
 
