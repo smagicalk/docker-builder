@@ -29,7 +29,7 @@
 | 数据库迁移 | init 容器 `migrate` | 对应上游 compose 的 `migrate-next` 服务，**命令逐字一致**（`cd /app/server && uv run --no-sync python -m agent_server.infra.db.migrations upgrade`）；跑完才起服务。迁移本身是幂等的，只应用还没应用的那部分 |
 | 外部依赖 | `postgres` / `redis` 两个 Service 用 `ExternalName` 指到你的外部库 | 服务名不变 → `AGENT_SERVER_DB_URL` 里的 `@postgres:5432` 与 `AGENT_SERVER_REDIS_URL` 里的 `redis:6379` **一行都不用改**。注意它不做端口转换、只能填域名 —— 见「用外部 PG / Redis」 |
 | 不等依赖 | 去掉了 `wait-for-postgres` init 容器 | 外部库的可用性不归 k8s 管：连不上时是 `migrate` 失败重试 + readiness 503，而不是干等 120 秒、或让 Pod 永远卡在 `Init` |
-| 探针分工 | startup / liveness 打 `/api/v2/health/live`；readiness 打 `/api/v2/health/ready` | `ready` 在数据库、Redis 或实时订阅不通时返回 **503** —— 拿它当 liveness 会把「依赖挂了」变成「不停重启」。`live` 只表示进程活着 |
+| 探针分工 | startup / liveness 打 `/api/v2/health/live`；readiness 打 `/api/v2/health/ready` | `ready` 在数据库、Redis 或实时订阅不通时返回 **503** —— 拿它当 liveness 会把「依赖挂了」变成「不停重启」。`live` 只表示进程活着（**它 200 不代表 Pod Ready**）。readiness 另给 `timeoutSeconds: 5`：`ready` 内部对 DB 允许 3s×2、对 Redis 2s，用默认的 1 秒会把「依赖有点慢」误判成超时 |
 | 数据库密码 | Secret 里只存一份，URL 用 `$(POSTGRES_PASSWORD)` 展开拼 | 同一份密码不在清单里出现两遍，日后不会两边漂移。**必须是 hex**：`AGENT_SERVER_DB_URL` 是拼字符串拼出来的，密码里含 `@ : /` 会把这个 URL 拆坏（`$(VAR)` 展开只做文本替换，不做 URL 转义） |
 | postgres / redis（**自建模式**才涉及） | **不设** `runAsNonRoot` | 这两个官方镜像的入口脚本要先以 root 把数据目录属主改成 postgres / redis 再降权启动，强制非 root 会直接起不来（用外部服务时不适用） |
 | server 容器 | `allowPrivilegeEscalation: false` + `drop: [ALL]` | 镜像本身以 root 运行（上游 Dockerfile 没有 `USER`，标签里也没有），但它只需要监听 8000 与读写 `/data`，不需要任何提权 |
@@ -317,6 +317,7 @@ Pod 从此可以调度到任意节点。
 |---|---|
 | `server` 的 `migrate` init 容器失败 / `Init:CrashLoopBackOff` | 先看它自己的日志：`kubectl -n agents-anywhere logs deploy/server -c migrate`。三种典型：解析不出 `postgres`（那两个 ExternalName Service 没 apply，或 `externalName` 写错）、连接被拒（外部库没监听 / 防火墙 / 端口不对）、`password authentication failed`（见下面那一行） |
 | `migrate` 日志里 `ModuleNotFoundError: No module named 'psycopg'`（线程名 `postgres-migration-lock`），随后等约 120 秒才失败 | **DB URL 的驱动名写错了**：镜像里只装了 `asyncpg`（上游 `server/pyproject.toml` 的依赖表里没有 psycopg / psycopg2），必须显式写 **`postgresql+asyncpg://…`**。镜像内实测（SQLAlchemy 2.1.3）：`+asyncpg` → OK；`+psycopg` **和**不带驱动名的 `postgresql://` 都会报这个错（2.1 起 `postgresql://` 的默认驱动已是 psycopg）；`+psycopg2` 则报 `psycopg2`。改 `30-server.yaml` 里的 URL 后重新 apply |
+| Pod `Running` 但一直 `0/1`（`/api/v2/health/live` 明明一直在 200） | readiness 打的是**另一个**端点 `/api/v2/health/ready`（依赖不通返回 503）—— live 只证明进程活着。看明细：`kubectl -n agents-anywhere port-forward svc/server 8000:8000`，再 `curl -s http://127.0.0.1:8000/api/v2/health/ready`，响应里 `checks.database` / `checks.redis` / `checks.realtime` 哪项是 `error` 就是哪项挂了（最常见：**外部 Redis 没通**）。若 `describe` 里写的是 `context deadline exceeded` 而不是 503，那是探针超时太紧 —— 本清单 readiness 已给 `timeoutSeconds: 5` |
 | `externalName` 填了 IP，或端口对不上 | ExternalName 是 CNAME：**只能填域名**，填 IP 解析不出来；它也**不做端口转换** —— URL 里写的 5432 / 6379 就是实际拨出去的端口 |
 | Pod `Pending`，事件说 `unbound Immediate PersistentVolumeClaims` | PV/PVC 绑不上：`claimRef.namespace` 写错，或 PV 与 PVC 的 `storageClassName` 不一致（静态供给时两边必须**同时**是空字符串） |
 | Pod `CreateContainerConfigError` | 少了 Secret：`kubectl -n agents-anywhere get secret agents-anywhere-secret`（两个键 `postgres-password` / `agent-server-secret` 都要有），且必须在 apply 之前建好 |

@@ -181,11 +181,15 @@ spec:
               port: http
             periodSeconds: 2
             failureThreshold: 60
+          # readiness 打的是 ready（依赖不通返回 503）；**别**把它当 liveness（会变成重启风暴）。
+          # timeoutSeconds 给 5 秒：ready 内部对 DB 允许 3s（两次）、对 Redis 2s —— 用默认的
+          # 1 秒会把「依赖有点慢」误判成探针超时（describe 里是 context deadline exceeded，不是 503）。
           readinessProbe:
             httpGet:
               path: /api/v2/health/ready
               port: http
             periodSeconds: 10
+            timeoutSeconds: 5
           livenessProbe:
             httpGet:
               path: /api/v2/health/live
