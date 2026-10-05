@@ -79,6 +79,9 @@ curl -s http://127.0.0.1:4000/ready      # {"status":"ready"}
 | ② **网关侧重放**（对齐上游） | 读 409 响应里的 `x-reroute-target`，把升级请求重放到那台。`instance=<Pod 名>` 在 headless Service 里正好能解析成 Pod IP（本清单把 target 设成 Pod 名就是为了这一步） | 要自己实现：Envoy 的 Lua / Wasmer 过滤器，或一个外部处理器 |
 | ③ **让重试概率收敛**（务实降级） | Istio `VirtualService`：`retries: {attempts: 3, retriableStatusCodes: [409]}`（Istio 的重试会换 host） | 不是协议级保证，只是概率收敛；每次重试多一次往返。⚠️ k8s Service 的 `sessionAffinity: ClientIP` 在这里**无效**（流量由网关的 Envoy 直接负载均衡，不经过 kube-proxy）；要按源 IP 亲和得用 Istio `DestinationRule` 的 `consistentHash: {useSourceIp: true}` |
 
+
+**推荐就停在单副本**：默认每节点 2 万条 WebSocket 通常够用；容量不够先**纵向**调（见
+[`k8s/README.md`](k8s/README.md) 的「容量参数」表）。多副本只在确有必要时做 —— 上面那条 reroute 得自己补。
 ### 怎么判断有没有踩到
 
 `/metrics` 里有 **`paseo_relay_reroute_responses_total`** —— 每次返回 409 都会 +1。扩副本后盯它：

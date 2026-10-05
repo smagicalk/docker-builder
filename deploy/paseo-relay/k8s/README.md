@@ -18,7 +18,7 @@
 | 点 | 做法 | 为什么 |
 |---|---|---|
 | 副本数 | 默认 `replicas: 1` | 「归属」是每节点内存态：某 session 的 owner 在哪台，后续连接就必须落到那台。跨节点要靠**代理把 409 + reroute 头重放**，k8s 里没有现成适配器 → 单副本永远不会 409。扩副本见「扩容」 |
-| 节点发现 | headless Service + **`publishNotReadyAddresses: true`** | DNSCluster 查这个名字拿到**所有** Pod IP。不加这一项会**死锁**：Pod 未 Ready 就默认不在 DNS 里，而「Ready」又要求达到 cluster floor —— 两副本同时启动会互相看不到 |
+| 节点发现 | headless Service + **`publishNotReadyAddresses: true`** | DNSCluster 查这个名字拿到**所有** Pod IP（单副本时它解析到自己 —— 实测无噪音：`/ready` 200、日志 0 条报错）。不加 `publishNotReadyAddresses` 会**死锁**：Pod 未 Ready 就默认不在 DNS 里，而「Ready」又要求达到 cluster floor —— 两副本同时启动会互相看不到 |
 | 节点身份 | `RELEASE_NODE=paseo_relay@$(POD_IP)`（`status.podIP`） | 每个实例必须唯一；与上游 Fly 适配层同一套（它用实例私有 IP），所以 `PASEO_RELAY_CLUSTER_QUERY` 解析出来的 IP 正好能对上节点名 |
 | 集群密钥 | `RELEASE_COOKIE` 从 Secret 读 | Erlang 集群共享密钥，**各副本必须完全一致**，否则节点连不上（表现：`/ready` 一直 503、日志里没有对端 `nodeup`） |
 | 探针分工 | readiness 打 `/ready`，startup/liveness 打 `/health` | `/ready` 在 draining、**低于 cluster floor**、容量或内存压力时返回 503；`/health` 只证明 HTTP 进程活着。拿 `/ready` 当 liveness 会把「集群没组起来」变成重启风暴 |
@@ -73,7 +73,7 @@ kubectl -n paseo-relay exec deploy/paseo-relay -- \
 
 ## 扩容（多副本）
 
-单副本已经能吃到一台机器的默认上限（每节点 2 万条 WebSocket）。要横向扩，**按这个顺序**：
+**推荐就停在单副本**：默认每节点 2 万条 WebSocket，容量不够时先**纵向**调（见下面「容量参数」）。确有必要横向扩时，按这个顺序：
 
 1. **先解决跨节点 reroute**（见 [`../README.md`](../README.md) 的「单副本 vs 多副本」）：非 owner 节点会对
    WebSocket 升级请求返回 **`409`** + reroute 头（默认 `x-reroute-target: instance=<Pod 名>`），需要**你的
