@@ -170,13 +170,19 @@ docker pull ghcr.io/<owner>/agents-anywhere:latest
 | 标签 | `latest` 与 `main`（都指 main 的最新构建）、`sha-<前12位>` |
 | 平台 | amd64 + arm64（Elixir 是纯 BEAM 编译，QEMU 下可接受；两个基础镜像都是多架构的） |
 | 构建上下文 | main 分支的源码 tarball（整仓库：根目录 `Dockerfile` 要 `COPY mix.exs / mix.lock / config / lib`） |
-| 运行 | 监听 **4000**；`PASEO_RELAY_HOST` / `PASEO_RELAY_PORT` / `PASEO_RELAY_DRAIN` 可覆盖；`/metrics` 是 Prometheus 指标（细节见上游 `OPERATIONS.md`） |
+| 运行 | 监听 **4000**；`PASEO_RELAY_HOST` / `PASEO_RELAY_PORT` / `PASEO_RELAY_DRAIN` 可覆盖；健康端点 `/health` 与 `/ready`、Prometheus 指标 `/metrics`（细节见上游 `OPERATIONS.md`） |
 
 ```bash
 docker pull ghcr.io/<owner>/paseo-relay:latest
 ```
 
 **手动构建**：Actions → **paseo-relay** → Run workflow —— 勾 `force` 忽略「HEAD 没变」强制重建。
+
+> ⚠️ **启动日志里会有一条 latin1 警告**：`the VM is running with native name encoding of latin1 …`。
+> 原因是运行时基础层 `debian:bookworm-slim` 没设 locale，而上游 Dockerfile（含它自己的
+> `deployment/fly/Dockerfile`）也没设 —— 不是打包引入的。部署时加一个环境变量即可消掉：
+> `LANG=C.UTF-8`（或 `ELIXIR_ERL_OPTIONS=+fnu`）。实测镜像本身能正常起：`/health` 与 `/ready`
+> 都返回 200、`/metrics` 里 `paseo_relay_ready 1`（上游 Fly 的健康检查用的就是 `/ready`）。
 
 > 上游是 **Apache-2.0**（仓库里有 LICENSE），镜像标签里记了 `upstream.license=Apache-2.0`
 > 与 `upstream.commit`，可以逐字对回是哪个提交打出来的。
