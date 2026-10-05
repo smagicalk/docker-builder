@@ -128,8 +128,6 @@ jobs:
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.version=${{ steps.release.outputs.tag }}
             org.opencontainers.image.licenses=MIT
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
 
       - name: Summary
         if: steps.check.outputs.need_build == '1'
