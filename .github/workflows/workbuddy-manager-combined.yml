@@ -1,0 +1,147 @@
+# Build a single-container WorkBuddy Manager + workbuddy2api image from the
+# upstream manager Release bundle. The existing two-container image/workflow is
+# intentionally untouched.
+name: workbuddy-manager-combined
+
+on:
+  schedule:
+    - cron: '41 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Build and publish even when the upstream Release is unchanged'
+        type: boolean
+        default: false
+  push:
+    paths:
+      - '.github/workflows/workbuddy-manager-combined.yml'
+      - 'deploy/workbuddy/workbuddy-manager-single/**'
+
+concurrency:
+  group: workbuddy-manager-combined
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  UPSTREAM_REPO: ithtelab/workbuddy-manager
+  IMAGE_NAME: workbuddy-manager-combined
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    if: github.event_name != 'push' || github.ref_name == github.event.repository.default_branch
+    steps:
+      - name: Checkout build definitions
+        uses: actions/checkout@v4
+
+      - name: Resolve image name
+        id: image
+        run: |
+          set -euo pipefail
+          echo "ghcr=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${IMAGE_NAME,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Find latest manager Release assets
+        id: release
+        run: |
+          set -euo pipefail
+          API="https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest"
+          JSON="$(curl -fsSL -H 'Accept: application/vnd.github+json' "$API")"
+          TAG="$(printf '%s' "$JSON" | jq -r '.tag_name')"
+          ASSET_NAME="$(printf '%s' "$JSON" | jq -r '.assets[] | select(.name | startswith("workbuddy-manager-") and endswith(".tar.gz")) | .name' | head -n1)"
+          URL="$(printf '%s' "$JSON" | jq -r --arg name "$ASSET_NAME" '.assets[] | select(.name == $name) | .browser_download_url')"
+          DIGEST="$(printf '%s' "$JSON" | jq -r --arg name "$ASSET_NAME" '.assets[] | select(.name == $name) | (.digest // "")')"
+          DIGEST="${DIGEST#sha256:}"
+          [ -n "$TAG" ] && [ -n "$URL" ] || { echo '::error::Latest Release is missing tag or tar.gz asset'; exit 1; }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "Latest upstream Release: $TAG"
+          echo "Asset: $URL"
+          echo "Digest: ${DIGEST:-not supplied by API}"
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check whether this Release is already built
+        id: check
+        env:
+          IMAGE: ${{ steps.image.outputs.ghcr }}
+          TAG: ${{ steps.release.outputs.tag }}
+          FORCE: ${{ inputs.force }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [ "$FORCE" = true ] || [ "$EVENT_NAME" = push ]; then
+            echo 'need_build=1' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if docker buildx imagetools inspect "${IMAGE}:${TAG}" >/dev/null 2>&1; then
+            echo "${IMAGE}:${TAG} already exists; skip"
+            echo 'need_build=0' >> "$GITHUB_OUTPUT"
+          else
+            echo 'need_build=1' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download Release bundle and verify digest
+        if: steps.check.outputs.need_build == '1'
+        env:
+          URL: ${{ steps.release.outputs.url }}
+          EXPECTED: ${{ steps.release.outputs.digest }}
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 --retry-delay 3 "$URL" -o manager-release.tar.gz
+          ACTUAL="$(sha256sum manager-release.tar.gz | cut -d' ' -f1)"
+          if [ -n "$EXPECTED" ] && [ "$EXPECTED" != "$ACTUAL" ]; then
+            echo "::error::Release asset digest mismatch: expected $EXPECTED, actual $ACTUAL"
+            exit 1
+          fi
+          mkdir -p release
+          tar -xzf manager-release.tar.gz -C release --strip-components=1
+          test -f release/Dockerfile
+          test -f release/upstream/go.mod
+          test -f release/upstream/config.example.json
+          test -f release/server/main.py
+          test -f release/web/out/index.html
+          mkdir -p build-context
+          cp -a release/. build-context/
+
+      - name: Build and publish combined image
+        if: steps.check.outputs.need_build == '1'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/workbuddy/workbuddy-manager-single/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ steps.image.outputs.ghcr }}:latest
+            ${{ steps.image.outputs.ghcr }}:${{ steps.release.outputs.tag }}
+          labels: |
+            org.opencontainers.image.title=WorkBuddy Manager Combined
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.release.outputs.tag }}
+            org.opencontainers.image.licenses=MIT
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        if: steps.check.outputs.need_build == '1'
+        env:
+          IMAGE: ${{ steps.image.outputs.ghcr }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          {
+            echo '## Combined WorkBuddy image published'
+            echo
+            echo "- Source Release: \`${TAG}\`"
+            echo "- Image: \`${IMAGE}:${TAG}\`"
+            echo '- Platforms: linux/amd64, linux/arm64'
+            echo '- Includes manager + workbuddy2api; configure persistent volumes per deploy/workbuddy/workbuddy-manager-single/README.md'
+          } >> "$GITHUB_STEP_SUMMARY"

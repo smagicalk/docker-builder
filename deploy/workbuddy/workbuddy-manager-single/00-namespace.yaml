@@ -1,0 +1,7 @@
+# Reuse the existing WorkBuddy namespace; kept as a separate, convenient apply entry.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: workbuddy
+  labels:
+    app.kubernetes.io/part-of: workbuddy

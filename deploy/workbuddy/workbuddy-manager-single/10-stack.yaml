@@ -1,0 +1,196 @@
+# Single-container WorkBuddy Manager + workbuddy2api.
+# This is a separate alternative to ../k8s/10-stack.yaml. Reuses the same PVCs/Secrets.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: workbuddy-single
+  namespace: workbuddy
+  labels:
+    app.kubernetes.io/name: workbuddy-single
+    app.kubernetes.io/part-of: workbuddy
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: workbuddy-single
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: workbuddy-single
+        app.kubernetes.io/part-of: workbuddy
+    spec:
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      initContainers:
+        - name: init-config
+          image: ghcr.io/smagicalk/workbuddy-manager-combined:latest
+          imagePullPolicy: Always
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              if [ -f /cfg/config.json ]; then
+                echo '[init] existing config.json preserved'
+                exit 0
+              fi
+              printf '%s\n' \
+                '{' \
+                '  "listen": ":7863",' \
+                '  "api_key": "",' \
+                '  "auth_dir": "./auths",' \
+                '  "state_file": "./data/state.json",' \
+                '  "schedule": {' \
+                '    "checkin_hours": [9, 21], "travel_hours": [9, 21],' \
+                '    "activity_hours": [10], "keepalive_hours": [22],' \
+                '    "school_hours": [12], "cat_hours": [1],' \
+                '    "checkin_enabled": true, "travel_enabled": true,' \
+                '    "activity_enabled": true, "keepalive_enabled": true,' \
+                '    "school_enabled": true, "cat_enabled": true' \
+                '  }' \
+                '}' > /cfg/config.json
+              chmod 0664 /cfg/config.json
+              python3 -c 'import json; json.load(open("/cfg/config.json"))'
+          volumeMounts:
+            - name: config
+              mountPath: /cfg
+      containers:
+        - name: workbuddy-single
+          image: ghcr.io/smagicalk/workbuddy-manager-combined:latest
+          imagePullPolicy: Always
+          env:
+            - name: TZ
+              value: Asia/Shanghai
+            - name: WB_MANAGER_HOST
+              value: 0.0.0.0
+            - name: WB2API_MODE
+              value: native
+            - name: WB2API_BASE
+              value: http://127.0.0.1:7863
+            - name: WB2API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: workbuddy2api-secret
+                  key: api_key
+            - name: WB2A_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: workbuddy2api-secret
+                  key: api_key
+            - name: WB_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: workbuddy-manager-secret
+                  key: admin-password
+                  optional: true
+            - name: WB_AUTH_DIR
+              value: /opt/workbuddy2api/auths
+            - name: WB_UPSTREAM_DIR
+              value: /opt/workbuddy2api
+            - name: WB_UPSTREAM_CONFIG
+              value: /opt/workbuddy2api/config.json
+            - name: WB2API_START_SCRIPT
+              value: /opt/workbuddy2api/start-upstream.sh
+            - name: WB2API_STOP_SCRIPT
+              value: /opt/workbuddy2api/stop-upstream.sh
+            - name: WB2API_LOG_FILE
+              value: /opt/workbuddy2api/data/server.err.log
+            - name: WB_TRUST_PROXY
+              value: "1"
+            - name: WB_TRUSTED_PROXY_HOPS
+              value: "1"
+            - name: WB_ENABLE_DOCS
+              value: "0"
+          ports:
+            - name: web
+              containerPort: 7864
+            - name: api
+              containerPort: 7863
+          startupProbe:
+            httpGet:
+              path: /api/healthz
+              port: web
+            periodSeconds: 2
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /api/healthz
+              port: web
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/healthz
+              port: web
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 1536Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: manager-data
+              mountPath: /app/data
+            - name: config
+              mountPath: /opt/workbuddy2api/config.json
+              subPath: config.json
+            - name: auths
+              mountPath: /opt/workbuddy2api/auths
+            - name: pool
+              mountPath: /opt/workbuddy2api/data
+      volumes:
+        - name: config
+          persistentVolumeClaim:
+            claimName: workbuddy2api-config
+        - name: auths
+          persistentVolumeClaim:
+            claimName: workbuddy2api-auths
+        - name: pool
+          persistentVolumeClaim:
+            claimName: workbuddy2api-pool
+        - name: manager-data
+          persistentVolumeClaim:
+            claimName: workbuddy-manager-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: workbuddy-manager
+  namespace: workbuddy
+  labels:
+    app.kubernetes.io/part-of: workbuddy
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: workbuddy-single
+  ports:
+    - name: web
+      port: 7864
+      targetPort: web
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: workbuddy2api
+  namespace: workbuddy
+  labels:
+    app.kubernetes.io/part-of: workbuddy
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: workbuddy-single
+  ports:
+    - name: api
+      port: 7863
+      targetPort: api
