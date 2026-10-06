@@ -40,9 +40,10 @@ curl -s http://127.0.0.1:4000/ready      # {"status":"ready"}
 
 ## 组网契约（多节点才用得上）
 
-节点之间只用 **OTP 分布 + DNS 发现**，没有任何外部协调服务。这几件事必须对上：
+节点之间只用 **OTP 分布 + DNS 发现**，没有任何外部协调服务。**单实例清单里没有这些变量**（不需要）；
+要扩副本时按下面这张表补齐，可粘贴的配方在 [`k8s/README.md`](k8s/README.md) 的「扩容（多副本）」：
 
-| 变量 | 作用 | 本仓库清单里的值 |
+| 变量 | 作用 | 多副本时要设的值 |
 |---|---|---|
 | `RELEASE_DISTRIBUTION` | 用长节点名（`name@host`） | `name` |
 | `RELEASE_NODE` | 每个实例**唯一**的节点名 | `paseo_relay@<Pod IP>`（k8s 用 `status.podIP` 展开） |
@@ -53,7 +54,7 @@ curl -s http://127.0.0.1:4000/ready      # {"status":"ready"}
 
 **本地实测过**（两个容器 + 共享 DNS 别名 ≈ k8s 的 headless Service）：`MIN_CLUSTER_SIZE=2` 时
 两节点 `/ready` 都返回 `200 {"status":"ready"}`，日志里能看到对端 `nodeup` / `discover_request` ——
-也就是说这套变量确实能把集群组起来。
+也就是说这套变量确实能把集群组起来（**但本仓库的清单默认是单实例形态，并没有这些**）。
 
 ## 单副本 vs 多副本（重要）
 
@@ -75,7 +76,7 @@ curl -s http://127.0.0.1:4000/ready      # {"status":"ready"}
 
 | 选项 | 做法 | 代价 / 风险 |
 |---|---|---|
-| ① **单副本**（本清单默认） | 什么都不用做 | 没有 409；默认每节点 2 万条 WebSocket，多数场景够用 |
+| ① **单副本**（本清单就是这个形态） | 什么都不用做 | 没有 409；默认每节点 2 万条 WebSocket，多数场景够用 |
 | ② **网关侧重放**（对齐上游） | 读 409 响应里的 `x-reroute-target`，把升级请求重放到那台。`instance=<Pod 名>` 在 headless Service 里正好能解析成 Pod IP（本清单把 target 设成 Pod 名就是为了这一步） | 要自己实现：Envoy 的 Lua / Wasmer 过滤器，或一个外部处理器 |
 | ③ **让重试概率收敛**（务实降级） | Istio `VirtualService`：`retries: {attempts: 3, retriableStatusCodes: [409]}`（Istio 的重试会换 host） | 不是协议级保证，只是概率收敛；每次重试多一次往返。⚠️ k8s Service 的 `sessionAffinity: ClientIP` 在这里**无效**（流量由网关的 Envoy 直接负载均衡，不经过 kube-proxy）；要按源 IP 亲和得用 Istio `DestinationRule` 的 `consistentHash: {useSourceIp: true}` |
 
@@ -94,7 +95,9 @@ curl -s http://127.0.0.1:4000/ready      # {"status":"ready"}
 
 ## 与上游 Fly 部署的对应关系
 
-上游自己的部署在 `deployment/fly/`，可以逐条对照（我们的清单就是照它翻译的）：
+上游自己的部署在 `deployment/fly/`，可以逐条对照。下表按**多副本**形态对照 —— 本仓库的清单默认是
+**单实例**，去掉了组网那几项（`RELEASE_*` / `CLUSTER_QUERY` / `OWNERSHIP_TARGET`，多副本时按
+[`k8s/README.md`](k8s/README.md) 的「扩容（多副本）」加回）：
 
 | 上游 Fly | 本仓库 |
 |---|---|

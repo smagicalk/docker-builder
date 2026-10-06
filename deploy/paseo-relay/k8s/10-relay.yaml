@@ -1,47 +1,16 @@
-# Paseo Relay：Elixir/OTP 写的 WebSocket 中继（上游 getpaseo/paseo-relay）。
+# Paseo Relay：Elixir/OTP 写的 WebSocket 中继（上游 getpaseo/paseo-relay）——**单实例**部署。
 #
-# ── 先建 Secret 再 apply（**刻意不放进清单**：放进去每次 apply 都会用占位值覆盖真值）──
+# ── 这个部署的形态（下面这套就是实测过的那套）────────────────────────
+#   · **单实例**：`replicas: 1`，并且**关掉 Erlang 分布**（RELEASE_DISTRIBUTION=none）——
+#     不起 epmd、不监听 4369、不解析任何集群 DNS；
+#   · **无任何持久化**：没有库 / Redis / 卷，状态在节点内存里，重启即丢（客户端重连即可）；
+#   · 因此只有两个对象：Deployment + Service，**不需要 Secret**。
+#   实测（本机容器，环境变量与本清单一致）：/ready 返回 200、/metrics 里 paseo_relay_ready 1、
+#   日志 0 条报错、4369 无监听。
 #
-#   kubectl -n paseo-relay create secret generic paseo-relay-secret \
-#     --from-literal=release-cookie="$(openssl rand -base64 48)" \
-#     --dry-run=client -o yaml | kubectl apply -f -
-#
-#   RELEASE_COOKIE 是 Erlang 集群的共享密钥：**各副本必须完全一致**，否则节点之间
-#   根本连不上（表现是 /ready 一直 503、日志里没有对端 nodeup）。
-#   单副本也照样要它 —— 省得以后扩副本时才发现不一致。
-#
-# ── 这个部署的形态（都与上游契约对齐，见 ../README.md「组网契约」）────────
-#   · 无任何持久化：没有库 / Redis / 卷，状态在节点内存里，重启即丢（客户端重连）；
-#   · 默认 **1 副本**：中继的「归属」是每节点内存里的，跨节点要靠部署方的代理把
-#     WebSocket 升级请求重放到 owner（非 owner 返回 409 + reroute 头）。
-#     k8s 里**没有**现成的这种适配器，所以默认单副本；扩副本前先看 README 那一节；
-#   · 组网变量仍然全留着（RELEASE_NODE / COOKIE / CLUSTER_QUERY / OWNERSHIP_TARGET），
-#     单副本时它们是无害的，扩副本时只需要改 replicas 与 MIN_CLUSTER_SIZE。
-
----
-# 给「节点发现」用的 headless Service：DNSCluster 查这个名字，拿到**所有 Pod IP**，
-# 于是各节点用 paseo_relay@<pod-ip> 互相连上（本地用两个容器 + 共享 DNS 别名实测过）。
-#
-# ⚠️ publishNotReadyAddresses: true 是**必须**的：Pod 未 Ready 时默认会从 DNS 里摘掉，
-#    而「Ready」本身又要求达到 cluster floor（PASEO_RELAY_MIN_CLUSTER_SIZE）——
-#    两副本同时启动时就会互相看不到、谁都到不了 floor，形成死锁。
-apiVersion: v1
-kind: Service
-metadata:
-  name: paseo-relay-headless
-  namespace: paseo-relay
-  labels:
-    app.kubernetes.io/name: paseo-relay
-    app.kubernetes.io/part-of: paseo-relay
-spec:
-  clusterIP: None
-  publishNotReadyAddresses: true
-  selector:
-    app.kubernetes.io/name: paseo-relay
-  ports:
-    - name: relay
-      port: 4000
-      targetPort: relay
+# ⚠️ **别只把 replicas 改大**：中继的「归属」是每节点内存态 —— 多副本必须先把节点组起来
+#    （headless Service + 共享 cookie + RELEASE_NODE / CLUSTER_QUERY / MIN_CLUSTER_SIZE…），
+#    而且跨节点重连还要网关重放 409。可直接粘贴的完整配方见 ../README.md 的「扩容（多副本）」。
 
 ---
 apiVersion: apps/v1
@@ -53,14 +22,13 @@ metadata:
     app.kubernetes.io/name: paseo-relay
     app.kubernetes.io/part-of: paseo-relay
 spec:
-  # 默认 1 副本（见文件开头）。扩副本：改这里 + 把下面的 PASEO_RELAY_MIN_CLUSTER_SIZE 一起改大。
-  # ⚠️ 多副本下**只有「重连」**可能落到非 owner（→ 409 + reroute 头，需网关重放；全新会话不受影响）。
-  #    判断依据：/metrics 的 paseo_relay_reroute_responses_total —— 详见 ../README.md「单副本 vs 多副本」。
+  # 单实例。改大之前先读 ../README.md 的「扩容（多副本）」——
+  # 否则会变成 N 个互不相识的节点各自为政（客户端重连会收到 409）。
   replicas: 1
   strategy:
     type: RollingUpdate
     rollingUpdate:
-      # 多副本时一次只换一个，避免集群 floor 被瞬间打穿（单副本无所谓）。
+      # 先起新的、再删旧的：换版本时不出现服务空窗。
       maxUnavailable: 0
       maxSurge: 1
   selector:
@@ -80,45 +48,16 @@ spec:
           # 镜像由本仓库 CI 构建、标签是 latest：必须每次拉取，否则节点上会一直复用旧镜像。
           imagePullPolicy: Always
           env:
-            # ── 本实例是谁（必须先定义，下面用 $(VAR) 展开）──────────────
-            - name: POD_IP
-              valueFrom:
-                fieldRef:
-                  fieldPath: status.podIP
-            - name: POD_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.name
-            # ── 监听 ──────────────────────────────────────────────────
+            # ── 监听（镜像里已设成这两个值，写出来是为了显眼）────────────
             - name: PASEO_RELAY_HOST
               value: 0.0.0.0
             - name: PASEO_RELAY_PORT
               value: "4000"
-            # ── 组网（Erlang 分布 + DNS 发现）──────────────────────────
-            # 长节点名，且每个实例必须唯一 —— 上游的 Fly 适配层同样是
-            # RELEASE_NODE=paseo_relay@${实例私有 IP}，这里用 Pod IP（同一套契约）。
+            # ── 单实例：关掉 Erlang 分布 ───────────────────────────────
+            # 不需要节点发现，也就不起 epmd、不监听 4369（实测无副作用：/ready 200、0 报错）。
+            # 多副本时要改成 name，并补齐 RELEASE_NODE / RELEASE_COOKIE / CLUSTER_QUERY 等（见 README）。
             - name: RELEASE_DISTRIBUTION
-              value: name
-            - name: RELEASE_NODE
-              value: paseo_relay@$(POD_IP)
-            # 集群共享密钥，来自 Secret（各副本必须一致，否则组不起来）。
-            - name: RELEASE_COOKIE
-              valueFrom:
-                secretKeyRef:
-                  name: paseo-relay-secret
-                  key: release-cookie
-            # 用 headless Service 的 FQDN 做节点发现：它会解析出**所有** Pod IP。
-            - name: PASEO_RELAY_CLUSTER_QUERY
-              value: paseo-relay-headless.paseo-relay.svc.cluster.local
-            # 低于这个节点数就报 not-ready（/ready 返回 503）。
-            # 单副本必须是 1；扩到 N 副本就改成 N（或你要的下限）。
-            - name: PASEO_RELAY_MIN_CLUSTER_SIZE
-              value: "1"
-            # 本实例对外公布的「我是谁」（不透明字符串，给 reroute 用）。
-            # 用 Pod 名：将来做 reroute 适配器时，这个名字在 headless Service 里正好
-            # 能解析成 Pod IP，方便把请求重放到 owner。
-            - name: PASEO_RELAY_OWNERSHIP_TARGET
-              value: instance=$(POD_NAME)
+              value: none
             # ── 运行时小修 ────────────────────────────────────────────
             # 镜像的运行时基础层没设 locale，不设这两项启动时会警告 latin1
             # （上游 Fly 适配层也设了 ELIXIR_ERL_OPTIONS=+fnu）。
@@ -130,8 +69,8 @@ spec:
             - name: relay
               containerPort: 4000
           # 上游语义：/health 只证明 HTTP 进程活着；/ready 才是「能不能接新活」
-          # （draining、低于 cluster floor、容量/内存压力时返回 503）。
-          # 所以 liveness 用 /health，readiness 用 /ready —— 反过来会变成重启风暴。
+          # （draining、容量/内存压力时返回 503）。所以 liveness 用 /health、readiness 用 /ready
+          # —— 反过来会变成重启风暴。
           startupProbe:
             httpGet:
               path: /health
@@ -175,7 +114,7 @@ spec:
               drop: ["ALL"]
 
 ---
-# 客户端 / 网关用的入口（headless 那个不对外）。
+# 客户端 / 网关用的入口。
 apiVersion: v1
 kind: Service
 metadata:
@@ -207,9 +146,9 @@ spec:
 #      listener 的 allowedRoutes.namespaces.from 允许，否则路由会被**静默忽略**
 #      （kubectl get httproute -n paseo-relay 看 Accepted / ResolvedRefs）。
 #
-# ⚠️ 多副本时还有第 4 点：非 owner 节点会对升级请求返回 **409** + reroute 头
-#    （默认 x-reroute-target，Fly 适配层用 fly-replay），要由**部署方的代理**把请求
-#    重放到 owner。k8s 里没有现成适配器 —— 详见 ../README.md「单副本 vs 多副本」。
+# ⚠️ 单实例不会遇到第 4 点；一旦扩成多副本就有：非 owner 节点会对升级请求返回 **409** +
+#    reroute 头（默认 x-reroute-target），要由**部署方的代理**把请求重放到 owner ——
+#    k8s 里没有现成适配器，详见 ../README.md「单副本 vs 多副本」。
 #
 # apiVersion: gateway.networking.k8s.io/v1
 # kind: HTTPRoute
