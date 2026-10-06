@@ -18,13 +18,9 @@ services:
     image: ghcr.io/smagicalk/paseo-relay:latest
     restart: unless-stopped
     environment:
-      PASEO_RELAY_HOST: 0.0.0.0
-      PASEO_RELAY_PORT: "4000"
-      # 单节点：集群下限就是 1。不设 PASEO_RELAY_CLUSTER_QUERY = 不做节点发现。
-      PASEO_RELAY_MIN_CLUSTER_SIZE: "1"
-      # 本实例对外公布的「我是谁」（不透明字符串，给跨节点 reroute 用）。
-      # 单节点随便填，但填上以后扩节点时语义一致。
-      PASEO_RELAY_OWNERSHIP_TARGET: instance-compose-1
+      # 单实例：关掉 Erlang 分布（不起 epmd、不监听 4369、不做任何节点发现）——
+      # 与 K8s 那份清单的形态一致。多副本才需要组网变量，见 k8s/README.md 的「扩容（多副本）」。
+      RELEASE_DISTRIBUTION: none
       # 镜像的运行时基础层没设 locale：不设这两项启动时会警告 latin1。
       LANG: C.UTF-8
       ELIXIR_ERL_OPTIONS: +fnu
