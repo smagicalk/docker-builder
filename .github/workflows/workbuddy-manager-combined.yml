@@ -45,22 +45,52 @@ jobs:
 
       - name: Find latest manager Release assets
         id: release
+        env:
+          # Optional: a PAT raises the GitHub API quota to 5000/h. Without it the
+          # unauthenticated quota (60/h per IP) is shared with other runner jobs
+          # and can return HTTP 403 — the redirect fallback below covers that case.
+          API_TOKEN: ${{ secrets.UPSTREAM_TOKEN }}
         run: |
           set -euo pipefail
+          REPO_URL="https://github.com/${UPSTREAM_REPO}"
           API="https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest"
-          JSON="$(curl -fsSL -H 'Accept: application/vnd.github+json' "$API")"
-          TAG="$(printf '%s' "$JSON" | jq -r '.tag_name')"
-          ASSET_NAME="$(printf '%s' "$JSON" | jq -r '.assets[] | select(.name | startswith("workbuddy-manager-") and endswith(".tar.gz")) | .name' | head -n1)"
-          URL="$(printf '%s' "$JSON" | jq -r --arg name "$ASSET_NAME" '.assets[] | select(.name == $name) | .browser_download_url')"
-          DIGEST="$(printf '%s' "$JSON" | jq -r --arg name "$ASSET_NAME" '.assets[] | select(.name == $name) | (.digest // "")')"
-          DIGEST="${DIGEST#sha256:}"
+          TAG=""; ASSET_NAME=""; URL=""; DIGEST=""
+
+          if [ -n "${API_TOKEN:-}" ]; then
+            JSON="$(curl -fsSL -H "Authorization: Bearer ${API_TOKEN}" \
+              -H 'Accept: application/vnd.github+json' "$API" || true)"
+          else
+            JSON="$(curl -fsSL -H 'Accept: application/vnd.github+json' "$API" || true)"
+          fi
+
+          if [ -n "$JSON" ]; then
+            TAG="$(printf '%s' "$JSON" | jq -r '.tag_name // ""')"
+            ASSET_NAME="$(printf '%s' "$JSON" | jq -r '.assets[] | select(.name | startswith("workbuddy-manager-") and endswith(".tar.gz")) | .name' | head -n1)"
+            URL="$(printf '%s' "$JSON" | jq -r --arg name "$ASSET_NAME" '.assets[] | select(.name == $name) | .browser_download_url // ""')"
+            DIGEST="$(printf '%s' "$JSON" | jq -r --arg name "$ASSET_NAME" '.assets[] | select(.name == $name) | (.digest // "")')"
+            DIGEST="${DIGEST#sha256:}"
+          fi
+
+          if [ -z "$TAG" ] || [ -z "$URL" ] || [ "$URL" = "null" ]; then
+            # The unauthenticated API is rate limited per IP (HTTP 403). The public
+            # releases redirect is not subject to that quota, so resolve the tag
+            # from it and build the asset URL from the documented naming scheme.
+            echo '::warning::GitHub API unavailable (rate limit?); falling back to the public releases redirect'
+            LOCATION="$(curl -fsSI -o /dev/null -w '%{redirect_url}' "${REPO_URL}/releases/latest")"
+            TAG="${LOCATION##*/}"
+            [ -n "$TAG" ] || { echo '::error::Could not resolve the latest manager Release'; exit 1; }
+            ASSET_NAME="workbuddy-manager-${TAG}.tar.gz"
+            URL="${REPO_URL}/releases/download/${TAG}/${ASSET_NAME}"
+            DIGEST=""
+          fi
+
           [ -n "$TAG" ] && [ -n "$URL" ] || { echo '::error::Latest Release is missing tag or tar.gz asset'; exit 1; }
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "url=$URL" >> "$GITHUB_OUTPUT"
           echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
           echo "Latest upstream Release: $TAG"
           echo "Asset: $URL"
-          echo "Digest: ${DIGEST:-not supplied by API}"
+          echo "Digest: ${DIGEST:-not supplied by API (verified locally after download)}"
 
       - name: Login to GHCR
         uses: docker/login-action@v3
